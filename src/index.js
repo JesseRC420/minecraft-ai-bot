@@ -393,6 +393,137 @@ const MODES = [
         bot.lookAt(targetPos.offset(0, player.entity.height || 1, 0));
       }
     }
+  },
+  {
+    name: 'tunnel',
+    description: 'Dig a staircase down to target Y. Triggered by "tunnel to y=11" chat. No LLM needed.',
+    interrupts: ['all'],
+    on: true,
+    active: false,
+    targetY: null,
+    startY: null,
+    digging: false,
+    lastStep: 0,
+    update: async function (bot) {
+      if (!this.active || this.targetY === null) return;
+      if (!bot.entity || !bot.entity.position) return;
+
+      const now = Date.now();
+      if (now - this.lastStep < 2000) return; // 2s between steps
+      this.lastStep = now;
+
+      const currentY = Math.round(bot.entity.position.y);
+
+      // Check if we reached the target
+      if (currentY <= this.targetY + 1) {
+        console.log(`[Tunnel] Reached target Y=${this.targetY}!`);
+        bot.chat(`Done! Dug staircase to Y=${currentY}`);
+        this.active = false;
+        this.targetY = null;
+        return;
+      }
+
+      // Check inventory
+      const mainSlots = bot.inventory.slots.slice(9, 45);
+      const emptySlots = mainSlots.filter(s => s === null).length;
+      if (emptySlots <= 1) {
+        console.log('[Tunnel] Inventory full, stopping');
+        bot.chat('Inventory full! Stopping tunnel.');
+        this.active = false;
+        this.targetY = null;
+        return;
+      }
+
+      // Equip best tool
+      const pickaxe = bot.inventory.items().find(i => i.name.includes('pickaxe'));
+      const shovel = bot.inventory.items().find(i => i.name.includes('shovel'));
+      if (pickaxe) {
+        try { await bot.equip(pickaxe, 'hand'); } catch (e) {}
+      }
+
+      // Get facing direction
+      const yaw = bot.entity.yaw;
+      const fwdX = -Math.round(Math.sin(yaw));
+      const fwdZ = -Math.round(Math.cos(yaw));
+
+      // Safety check: look ahead for lava
+      const lookAheadPos = bot.entity.position.offset(fwdX * 3, -3, fwdZ * 3);
+      const lookAheadBlock = bot.blockAt(lookAheadPos);
+      if (lookAheadBlock && (lookAheadBlock.name === 'lava' || lookAheadBlock.name === 'void_air')) {
+        console.log(`[Tunnel] Stopped — detected ${lookAheadBlock.name} ahead!`);
+        bot.chat(`Stopped — detected ${lookAheadBlock.name} ahead!`);
+        this.active = false;
+        this.targetY = null;
+        return;
+      }
+
+      try {
+        // Dig 2 blocks forward (2 wide) at head height and foot height
+        for (let w = 0; w < 2; w++) {
+          const sideX = w === 0 ? 0 : (fwdZ !== 0 ? 1 : 0);
+          const sideZ = w === 0 ? 0 : (fwdX !== 0 ? 1 : 0);
+
+          for (let h = 0; h < 2; h++) {
+            const digPos = bot.entity.position.offset(fwdX + sideX, h, fwdZ + sideZ);
+            const block = bot.blockAt(digPos);
+            if (block && block.name !== 'air') {
+              if (block.name === 'lava' || block.name === 'water') {
+                bot.chat(`Stopped — hit ${block.name}!`);
+                this.active = false;
+                this.targetY = null;
+                return;
+              }
+              // Switch to shovel for dirt/sand/gravel
+              if (shovel && (block.name.includes('dirt') || block.name.includes('sand') || block.name.includes('gravel'))) {
+                try { await bot.equip(shovel, 'hand'); } catch (e) {}
+              }
+              await bot.dig(block);
+              await new Promise(r => setTimeout(r, 500));
+            }
+          }
+        }
+
+        // Dig 2 blocks below (step down + headroom)
+        for (let d = 1; d <= 2; d++) {
+          const belowPos = bot.entity.position.offset(0, -d, 0);
+          const belowBlock = bot.blockAt(belowPos);
+          if (belowBlock && belowBlock.name !== 'air') {
+            if (belowBlock.name === 'lava' || belowBlock.name === 'water') {
+              bot.chat(`Stopped — hit ${belowBlock.name} below!`);
+              this.active = false;
+              this.targetY = null;
+              return;
+            }
+            // Switch to shovel for dirt/sand/gravel
+            if (shovel && (belowBlock.name.includes('dirt') || belowBlock.name.includes('sand') || belowBlock.name.includes('gravel'))) {
+              try { await bot.equip(shovel, 'hand'); } catch (e) {}
+            } else if (pickaxe) {
+              try { await bot.equip(pickaxe, 'hand'); } catch (e) {}
+            }
+            await bot.dig(belowBlock);
+            await new Promise(r => setTimeout(r, 500));
+          }
+        }
+
+        // Move forward and drop down using pathfinder
+        const nextStepPos = bot.entity.position.offset(fwdX, -1, fwdZ);
+        bot.pathfinder.setGoal(new pf.goals.GoalNear(nextStepPos.x, nextStepPos.y, nextStepPos.z, 1));
+        await new Promise((resolve) => {
+          const check = setInterval(() => {
+            const dist = bot.entity.position.distanceTo(nextStepPos);
+            if (dist < 2 || !bot.pathfinder?.goal) {
+              clearInterval(check);
+              resolve();
+            }
+          }, 300);
+          setTimeout(() => { clearInterval(check); resolve(); }, 4000);
+        });
+
+        console.log(`[Tunnel] Step: Y=${Math.round(bot.entity.position.y)} (target: ${this.targetY})`);
+      } catch (e) {
+        console.log(`[Tunnel] Error: ${e.message}`);
+      }
+    }
   }
 ];
 
@@ -454,51 +585,118 @@ function pickRandom(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 // ══════════════════════════════════════════════════════════════════════════════
 
 // ══════════════════════════════════════════════════════════════════════════════
-// TASK LIST — LLM's working memory for multi-step goals
+// ══════════════════════════════════════════════════════════════════════════════
+// GOAL TREE — Hierarchical goal system (tree structure)
 // ══════════════════════════════════════════════════════════════════════════════
 
-const MAX_TASKS = 8;
-const taskList = []; // { id, text, status: 'pending'|'done', createdAt }
+let goalTree = null; // { id, text, status, children: [] }
+let nextGoalId = 1;
 
-function addTask(text) {
-  if (taskList.length >= MAX_TASKS) {
-    // Remove oldest completed tasks first, then oldest pending
-    const doneIdx = taskList.findIndex(t => t.status === 'done');
-    if (doneIdx >= 0) taskList.splice(doneIdx, 1);
-    else taskList.shift();
+function createNode(text, parentId = null) {
+  const node = { id: nextGoalId++, text, status: 'pending', children: [] };
+  return node;
+}
+
+function findNode(node, id) {
+  if (!node) return null;
+  if (node.id === id) return node;
+  for (const child of node.children) {
+    const found = findNode(child, id);
+    if (found) return found;
   }
-  const task = { id: Date.now(), text, status: 'pending', createdAt: Date.now() };
-  taskList.push(task);
-  return task;
+  return null;
 }
 
-function completeTask(idOrText) {
-  // Try matching by ID first, then by partial text
-  let idx = taskList.findIndex(t => t.id === Number(idOrText));
-  if (idx < 0) idx = taskList.findIndex(t => t.text.toLowerCase().includes(String(idOrText).toLowerCase()));
-  if (idx < 0) return null;
-  taskList[idx].status = 'done';
-  return taskList[idx];
+function findParent(node, id) {
+  if (!node) return null;
+  for (const child of node.children) {
+    if (child.id === id) return node;
+    const found = findParent(child, id);
+    if (found) return found;
+  }
+  return null;
 }
 
-function getTaskSummary() {
-  if (taskList.length === 0) return 'No active tasks.';
-  return taskList.map((t, i) =>
-    `${i + 1}. [${t.status === 'done' ? 'x' : ' '}] ${t.text}`
-  ).join('\n');
+// Find the first active leaf (depth-first) — this is what the LLM should work on
+function findActiveLeaf(node) {
+  if (!node) return null;
+  if (node.status !== 'pending') return null;
+  if (node.children.length === 0) return node;
+  for (const child of node.children) {
+    const leaf = findActiveLeaf(child);
+    if (leaf) return leaf;
+  }
+  return null; // all children done, this node is effectively done
 }
 
-function cleanOldTasks() {
-  const now = Date.now();
-  for (let i = taskList.length - 1; i >= 0; i--) {
-    if (taskList[i].status === 'done' && now - taskList[i].createdAt > 300000) {
-      taskList.splice(i, 1); // Remove done tasks after 5 minutes
-    }
+// Count nodes by status
+function countNodes(node, status) {
+  if (!node) return 0;
+  let count = node.status === status ? 1 : 0;
+  for (const child of node.children) {
+    count += countNodes(child, status);
+  }
+  return count;
+}
+
+// Check if all children are done
+function allChildrenDone(node) {
+  if (!node) return true;
+  return node.children.every(c => c.status === 'done' || c.status === 'failed');
+}
+
+// Auto-complete parent nodes when all children are done
+function autoCompleteParents(node) {
+  if (!node) return;
+  for (const child of node.children) {
+    autoCompleteParents(child);
+  }
+  if (node.children.length > 0 && allChildrenDone(node) && node.status === 'pending') {
+    const anyFailed = node.children.some(c => c.status === 'failed');
+    node.status = anyFailed ? 'failed' : 'done';
+    console.log(`[Goal] Auto-completed: "${node.text}" → ${node.status}`);
   }
 }
 
-// Clean old tasks every 60s
-setInterval(cleanOldTasks, 60000);
+// Render the tree as indented text for the LLM
+function renderGoalTree(node, indent = 0, isLast = true) {
+  if (!node) return '';
+  const prefix = indent === 0 ? '' : (isLast ? '└─ ' : '├─ ');
+  const statusIcon = node.status === 'done' ? '✓' : node.status === 'failed' ? '✗' : '○';
+  const activeLeaf = findActiveLeaf(goalTree);
+  const isCurrent = activeLeaf && activeLeaf.id === node.id;
+  const marker = isCurrent ? ' ◄ YOU ARE HERE' : '';
+  let line = `${'  '.repeat(indent)}${prefix}${statusIcon} ${node.text}${marker}`;
+  
+  const lines = [line];
+  for (let i = 0; i < node.children.length; i++) {
+    lines.push(renderGoalTree(node.children[i], indent + 1, i === node.children.length - 1));
+  }
+  return lines.join('\n');
+}
+
+function getGoalSummary() {
+  if (!goalTree) return 'No active goal. Use set_goal() to start one.';
+  const pending = countNodes(goalTree, 'pending');
+  const done = countNodes(goalTree, 'done');
+  const failed = countNodes(goalTree, 'failed');
+  const total = pending + done + failed;
+  
+  let summary = `GOAL: "${goalTree.text}" [${done}/${total} done`;
+  if (failed > 0) summary += `, ${failed} failed`;
+  summary += `]\n`;
+  summary += renderGoalTree(goalTree);
+  
+  const leaf = findActiveLeaf(goalTree);
+  if (leaf) {
+    summary += `\n\nCURRENT TASK: "${leaf.text}" (id: ${leaf.id})`;
+    summary += `\nDo this step, then call complete_step(id:${leaf.id}).`;
+  } else if (pending === 0) {
+    summary += `\n\nAll steps completed!`;
+  }
+  
+  return summary;
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // TOOL NAME ALIASES — LLM sometimes invents names, map them to real tools
@@ -527,15 +725,21 @@ const TOOL_ALIASES = {
   make_item: 'craft',
   build_pillar: 'pillar_up',
   nerd_pole: 'pillar_up',
-  add_todo: 'add_task',
-  create_task: 'add_task',
-  new_task: 'add_task',
-  mark_done: 'complete_task',
-  finish_task: 'complete_task',
-  done: 'complete_task',
-  list_tasks: 'get_tasks',
-  show_tasks: 'get_tasks',
-  tasks: 'get_tasks',
+  // Old task/goal aliases → new goal tree
+  add_task: 'add_step',
+  add_todo: 'add_step',
+  create_task: 'add_step',
+  new_task: 'add_step',
+  complete_task: 'complete_step',
+  mark_done: 'complete_step',
+  finish_task: 'complete_step',
+  done: 'complete_step',
+  get_tasks: 'get_goal',
+  list_tasks: 'get_goal',
+  show_tasks: 'get_goal',
+  tasks: 'get_goal',
+  set_goal: 'set_goal',
+  cancel_goal: 'cancel_goal',
 };
 
 function parseLLMResponse(raw) {
@@ -568,7 +772,8 @@ function parseLLMResponse(raw) {
   // ── FORMAT 2: XML self-closing <tool key="val" /> ────────────────────────
   const VALID_TOOLS = new Set(['chat', 'goto', 'mine', 'chop', 'dig', 'place', 'equip', 'unequip',
     'eat', 'craft', 'attack', 'hunt', 'shear', 'drop', 'look', 'interact', 'use_block',
-    'set_goal', 'cancel_goal', 'pillar_up', 'stop', 'idle', 'add_task', 'complete_task', 'get_tasks']);
+    'set_goal', 'cancel_goal', 'add_step', 'complete_step', 'fail_step', 'get_goal',
+    'pillar_up', 'stop', 'idle']);
 
   const selfCloseMatch = cleaned.match(/<(\w+)\s+([^>]*?)\/?>/i);
   if (selfCloseMatch) {
@@ -701,7 +906,7 @@ function guessArgName(toolName) {
     goto: 'x', mine: 'block', craft: 'item', drop: 'item',
     attack: 'target', hunt: 'animal', equip: 'item',
     use_block: 'block', place: 'block', dig: 'direction',
-    add_task: 'text', complete_task: 'id',
+    set_goal: 'text', add_step: 'text', complete_step: 'id', fail_step: 'id',
   };
   return map[toolName] || 'value';
 }
@@ -883,7 +1088,7 @@ TOOLS (call one per response):
 - goto(x:number, y:number, z:number) — walk to coordinates
 - mine(block:"name", count:number) — find and mine blocks nearby
 - chop(count:number) — chop nearest tree for wood
-- dig(direction:"staircase"|"forward"|"up", count:number, y:number) — dig in a direction. Use staircase to dig a 2-wide, 2-tall staircase down. NEVER dig straight down (you'll fall into lava/caves)!
+- dig(direction:"staircase"|"forward"|"up", count:number, y:number) — dig a staircase down to a target Y level. Example: dig(direction:"staircase", y:11) digs down until reaching Y=11. NEVER use direction:"down" (you'll fall into lava/caves)!
 - place(block:"name", x:number, y:number, z:number) — place a block FROM YOUR INVENTORY at coordinates (NOTE: tool name is "place" not "place_block")
 - equip(item:"name") — equip item to hand
 - unequip() — unequip held item
@@ -908,10 +1113,14 @@ HOME & STORAGE:
 - deposit() — put items in a nearby chest (keeps tools, deposits everything else)
 - check_inventory() — check how many empty slots you have (use before long tasks)
 
-TASK MANAGEMENT (use these to plan multi-step work):
-- add_task(text:"description") — add a task to your list (max 8 tasks)
-- complete_task(id:"text or number") — mark a task as done
-- get_tasks() — view your current task list
+GOAL TREE (hierarchical goal system — work depth-first):
+- set_goal(text:"main goal") — set the main goal (clears any existing tree)
+- add_step(parent_id:number, text:"step description") — add a sub-step under a parent. If parent_id omitted, adds under the current active leaf.
+- complete_step(id:number) — mark a step as done (auto-completes parents when all children done)
+- fail_step(id:number) — mark a step as failed
+- get_goal() — view the goal tree with your current position
+
+WORKFLOW: set_goal() → add_step() to break it down → do each step → complete_step() → repeat until goal done
 
 ANIMAL DROPS:
 - sheep: wool (or shear for colored wool without killing), raw_mutton
@@ -1055,6 +1264,7 @@ function buildSystemPrompt(bot, personality, skillManager, advTracker) {
 - When the player asks you to do something, USE A TOOL to do it. Don't just chat about doing it.
 - If you need to craft something, call craft(). If you need to mine, call mine(). Don't say "let me do X" — just do X.
 - One tool per response. No explaining, just doing.
+- When the player says "dig to y=11", use y:11 (the number they said). Don't change it to your current Y level!
 
 PERSONALITY: ${personality.mood} | Energy: ${personality.energy}/100 | Boredom: ${personality.boredom}/100
 ${getPersonalityFlavor(personality)}
@@ -1066,11 +1276,11 @@ CURRENT STATE:
 - Time: ${bot.time.timeOfDay} (${bot.time.timeOfDay >= 12500 && bot.time.timeOfDay <= 23000 ? 'NIGHT' : 'DAY'})
 - Sleeping: ${MODES.find(m => m.name === 'sleep')?.sleeping ? 'YES (do not interrupt)' : 'no'}
 - Following: ${(() => { const f = MODES.find(m => m.name === 'follow_player'); return f?.active ? `YES — following ${f.target} (say "stop" to stop)` : 'no'; })()}
+- Tunneling: ${(() => { const t = MODES.find(m => m.name === 'tunnel'); return t?.active ? `YES — digging to Y=${t.targetY} (say "stop" to stop)` : 'no'; })()}
 - Held: ${heldItem}
 
-YOUR TASKS:
-${getTaskSummary()}
-When the player asks for something complex (build, craft multi-step, gather resources), break it into tasks using add_task(), then complete each step with complete_task(). This helps you stay on track.
+YOUR GOAL:
+${getGoalSummary()}
 
 YOUR INVENTORY (${inventory.length} items total):
 ${invSummary}
@@ -1131,62 +1341,6 @@ IMPORTANT: If the player asks a conversational question (like "what do you want 
 // ══════════════════════════════════════════════════════════════════════════════
 // GOAL SYSTEM — Accepts any string, traces recipe chains, shows tier info
 // ══════════════════════════════════════════════════════════════════════════════
-
-const activeGoal = { active: false, description: '', startedAt: 0 };
-
-function buildGoalPrompt(bot, goalText, advTracker, skillManager) {
-  const lines = [`GOAL: ${goalText}`];
-
-  // Check if it's an advancement ID
-  if (ADVANCEMENTS[goalText]) {
-    const adv = ADVANCEMENTS[goalText];
-    lines.push(`Advancement: ${adv.name} — ${adv.description}`);
-    if (adv.hints) lines.push(`Hints: ${adv.hints.join('; ')}`);
-    if (adv.requires) {
-      lines.push(`Requires: ${adv.requires.map(r => ADVANCEMENTS[r]?.name || r).join(', ')}`);
-    }
-  }
-
-  // Recipe chain for the goal item
-  const goalLower = goalText.toLowerCase();
-  const itemName = goalLower.replace(/[^a-z0-9_]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
-  const chain = getRecipeChain(itemName);
-  if (chain.length > 0) {
-    lines.push('\nRECIPE CHAIN:');
-    chain.forEach((step, i) => lines.push(`  ${i + 1}. ${step.action}`));
-  }
-
-  // Mining/tool tier info
-  const mcData = getMcData(bot);
-  const pickaxe = bot.inventory.items().find(i => i.name.includes('pickaxe'));
-  const pickMining = pickaxe ? (RECIPES[pickaxe.name]?.mining || 0) : 0;
-
-  if (goalLower.includes('mine') || goalLower.includes('iron') || goalLower.includes('diamond') || goalLower.includes('gold')) {
-    lines.push('\nMINING TIERS:');
-    lines.push('  Wood (mining:1): stone, coal, copper');
-    lines.push('  Stone (mining:2): iron, gold, lapis, redstone');
-    lines.push('  Iron (mining:3): diamond, emerald');
-    lines.push('  Diamond (mining:4): everything including obsidian');
-    lines.push(`  YOUR PICKAXE: mining level ${pickMining}`);
-    if (pickMining < 2 && (goalLower.includes('iron') || goalLower.includes('gold'))) {
-      lines.push('  ⚠ You need STONE pickaxe to mine iron/gold!');
-    }
-  }
-
-  // Tool/armor status for build goals
-  if (goalLower.includes('build') || goalLower.includes('craft')) {
-    const inventory = bot.inventory.items();
-    const hasCT = inventory.some(i => i.name === 'crafting_table');
-    const logs = inventory.filter(i => i.name.includes('_log'));
-    const planks = inventory.filter(i => i.name.includes('_planks'));
-    lines.push('\nRESOURCES:');
-    lines.push(`  Crafting table: ${hasCT ? 'YES' : 'NO (place one first!)'}`);
-    lines.push(`  Logs: ${logs.length ? logs.map(l => `${l.name}x${l.count}`).join(', ') : 'none'}`);
-    lines.push(`  Planks: ${planks.length ? planks.map(p => `${p.name}x${p.count}`).join(', ') : 'none'}`);
-  }
-
-  return lines.join('\n');
-}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // MEMORY / PERSISTENCE
@@ -1255,6 +1409,13 @@ function createBot() {
   advTracker = new AdvancementTracker();
   if (memoryData.advancements) advTracker.loadJSON(memoryData.advancements);
 
+  // Restore goal tree if it was in progress
+  if (memoryData.goalTree) {
+    goalTree = memoryData.goalTree;
+    nextGoalId = memoryData.nextGoalId || 1;
+    console.log(`[Goal] Restored goal tree: "${goalTree.text}"`);
+  }
+
   persistentMemory = new PersistentMemory();
   persistentMemory.load();
 
@@ -1309,6 +1470,8 @@ function createBot() {
       memoryData.skills = skillManager.toJSON();
       memoryData.advancements = advTracker.toJSON();
       memoryData.livingBrain = livingBrain ? livingBrain.toJSON() : null;
+      memoryData.goalTree = goalTree;
+      memoryData.nextGoalId = nextGoalId;
       saveMemory();
       if (persistentMemory) {
         persistentMemory.tick();
@@ -1359,6 +1522,33 @@ function createBot() {
         console.log('[Follow] Stopped following');
         return; // skip LLM
       }
+      // Also stop tunnel mode
+      const tunnelMode = MODES.find(m => m.name === 'tunnel');
+      if (tunnelMode.active) {
+        tunnelMode.active = false;
+        tunnelMode.targetY = null;
+        bot.pathfinder.setGoal(null);
+        bot.chat(`Stopped tunneling.`);
+        console.log('[Tunnel] Stopped by user');
+        return; // skip LLM
+      }
+    }
+
+    // TUNNEL: "tunnel to y=11", "dig to y=11", "mine to y=11"
+    const tunnelMatch = lowerMsg.match(/(?:tunnel|dig|mine|staircase)\s+(?:to\s+)?y=?\s*(\d+)/);
+    if (tunnelMatch) {
+      const targetY = parseInt(tunnelMatch[1]);
+      if (targetY < -64 || targetY > 320) {
+        bot.chat(`Invalid Y level: ${targetY}. Must be between -64 and 320.`);
+        return;
+      }
+      const tunnelMode = MODES.find(m => m.name === 'tunnel');
+      tunnelMode.targetY = targetY;
+      tunnelMode.active = true;
+      tunnelMode.lastStep = 0;
+      bot.chat(`Tunneling down to Y=${targetY}!`);
+      console.log(`[Tunnel] Starting tunnel to Y=${targetY}`);
+      return; // skip LLM
     }
 
     // Skip if busy processing
@@ -1484,7 +1674,7 @@ function startAutoPromptLoop() {
   setInterval(async () => {
     if (!bot || !bot.entity) return;
     if (botBusy || chatLock) return;
-    if (activeGoal.active) return;
+    if (goalTree) return; // Don't auto-prompt when goal is active
 
     const now = Date.now();
     // Cooldowns
@@ -1565,10 +1755,7 @@ async function handlePlayerMessage(username, message) {
     const systemPrompt = buildSystemPrompt(bot, personality, skillManager, advTracker);
     const contextLines = [`Player ${username} says: "${message}"`];
 
-    // Add goal context if active
-    if (activeGoal.active) {
-      contextLines.push(`\n${buildGoalPrompt(bot, activeGoal.description, advTracker, skillManager)}`);
-    }
+    // Goal context is now in the system prompt via getGoalSummary()
 
     // Add recent behavior log
     const recentBehavior = behaviorLog.slice(-5).map(b => b.action).join('; ');
@@ -1599,12 +1786,12 @@ async function handlePlayerMessage(username, message) {
       if (persistentMemory) persistentMemory.onToolUse(parsed.tool.name, toolResult, true);
 
       // Skip follow-up for chat/stop/idle — they already said what they wanted
-      const noFollowUp = ['chat', 'stop', 'idle', 'complete_task', 'get_tasks'];
+      const noFollowUp = ['chat', 'stop', 'idle', 'complete_step', 'fail_step', 'get_goal'];
       if (!noFollowUp.includes(parsed.tool.name)) {
         // Send tool result back to LLM for a natural follow-up response
         let followUpPrompt;
-        if (parsed.tool.name === 'add_task') {
-          followUpPrompt = `You just added a task: "${parsed.tool.args.text}". Now execute it immediately. Call the tool like: craft(item:"wooden_pickaxe") — just the tool call, nothing else.`;
+        if (parsed.tool.name === 'add_step') {
+          followUpPrompt = `You just added a step: "${parsed.tool.args.text}". Now execute it immediately. Call the tool like: craft(item:"wooden_pickaxe") — just the tool call, nothing else.`;
         } else {
           followUpPrompt = `You just performed this action for player ${username}:\nTool: ${parsed.tool.name}(${JSON.stringify(parsed.tool.args)})\nResult: ${toolResult}\n\nNow respond to the player with a short message about what you did or what happened. Keep it under 100 chars. Just the message, no tool calls.`;
         }
@@ -1666,32 +1853,6 @@ async function handlePlayerMessage(username, message) {
 // ══════════════════════════════════════════════════════════════════════════════
 // GOAL HANDLER — When user sets a goal
 // ══════════════════════════════════════════════════════════════════════════════
-
-async function handleGoalSet(goalText) {
-  activeGoal.active = true;
-  activeGoal.description = goalText;
-  activeGoal.startedAt = Date.now();
-  logBehavior(`set goal: ${goalText}`);
-
-  // Build goal prompt and send to LLM for planning
-  const goalPrompt = buildGoalPrompt(bot, goalText, advTracker, skillManager);
-  const systemPrompt = buildSystemPrompt(bot, personality, skillManager, advTracker);
-  const fullPrompt = systemPrompt + '\n\n' + goalPrompt + '\n\nPlan how to accomplish this goal. Call the first tool to start.';
-
-  try {
-    const response = await callLLM(fullPrompt);
-    const parsed = parseLLMResponse(response);
-
-    if (parsed.tool) {
-      logBehavior(`goal planning: ${parsed.tool.name}`);
-      await executeTool(parsed.tool.name, parsed.tool.args, 'system');
-    } else if (parsed.text) {
-      bot.chat(parsed.text.substring(0, 200));
-    }
-  } catch (e) {
-    console.error('[Goal] LLM error:', e.message);
-  }
-}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // LLM CALL — Auto-detects loaded model in LM Studio
@@ -1868,7 +2029,34 @@ async function executeTool(name, args, sender) {
             try {
               bot.pathfinder.setGoal(new pf.goals.GoalNear(block.position.x, block.position.y, block.position.z, 2));
               await new Promise(r => setTimeout(r, 3000));
+
+              // Equip the right tool before digging
+              if (needsPickaxe) {
+                const pickaxe = bot.inventory.items().find(i => i.name.includes('pickaxe'));
+                if (pickaxe) await bot.equip(pickaxe, 'hand');
+              } else {
+                // Try to find a tool for this block type
+                const shovel = bot.inventory.items().find(i => i.name.includes('shovel'));
+                const axe = bot.inventory.items().find(i => i.name.includes('axe'));
+                if (block.name.includes('dirt') || block.name.includes('sand') || block.name.includes('gravel')) {
+                  if (shovel) await bot.equip(shovel, 'hand');
+                } else if (block.name.includes('wood') || block.name.includes('log')) {
+                  if (axe) await bot.equip(axe, 'hand');
+                }
+              }
+
               await bot.dig(block);
+              // Wait for dig animation to complete
+              await new Promise(r => setTimeout(r, 500));
+
+              // Verify block was actually broken
+              const afterDig = bot.blockAt(block.position);
+              if (afterDig && afterDig.name !== 'air') {
+                console.log(`[Mine] Block ${block.name} not broken, retrying...`);
+                await bot.dig(block);
+                await new Promise(r => setTimeout(r, 500));
+              }
+
               skillManager.addXP('mining', 10, 'mine');
               skillManager.recordSuccess('mining', 'mine', `Mined ${blockName}`);
             } catch (e) {
@@ -1953,7 +2141,8 @@ async function executeTool(name, args, sender) {
               }
 
               // SAFETY CHECK: Make sure there's ground below the next position
-              const nextFloorPos = bot.entity.position.offset(fwdX, -2, fwdZ);
+              // After moving forward and dropping 1, the bot needs ground at Y-1
+              const nextFloorPos = bot.entity.position.offset(fwdX, -1, fwdZ);
               const nextFloorBlock = bot.blockAt(nextFloorPos);
               if (!nextFloorBlock || nextFloorBlock.name === 'air' || nextFloorBlock.name === 'void_air') {
                 // No ground below — place a block to bridge the gap
@@ -1963,15 +2152,24 @@ async function executeTool(name, args, sender) {
                 );
                 if (bridgingBlock) {
                   await bot.equip(bridgingBlock, 'hand');
-                  await bot.placeBlock(nextFloorBlock || bot.blockAt(nextFloorPos), new Vec3(0, 1, 0));
-                  logBehavior(`placed bridge block at y=${Math.round(nextFloorPos.y)}`);
+                  // Place block below where we'll land
+                  const placeTarget = bot.blockAt(nextFloorPos.offset(0, -1, 0));
+                  if (placeTarget && placeTarget.name !== 'air') {
+                    await bot.placeBlock(placeTarget, new Vec3(0, 1, 0));
+                    logBehavior(`placed bridge block at y=${Math.round(nextFloorPos.y)}`);
+                  }
                 } else {
-                  result = `Stopped — no ground ahead and no blocks to bridge!`;
-                  break;
+                  // No bridge blocks — just try to proceed (might work if there's a block we missed)
+                  logBehavior('no bridge blocks, attempting to proceed');
                 }
               }
 
               // Dig 2 blocks forward (2 wide) at head height and foot height
+              // Equip the right tool first
+              const pickaxe = bot.inventory.items().find(i => i.name.includes('pickaxe'));
+              const shovel = bot.inventory.items().find(i => i.name.includes('shovel'));
+              if (pickaxe) await bot.equip(pickaxe, 'hand');
+
               for (let w = 0; w < 2; w++) {
                 const sideX = w === 0 ? 0 : (fwdZ !== 0 ? 1 : 0);
                 const sideZ = w === 0 ? 0 : (fwdX !== 0 ? 1 : 0);
@@ -1989,10 +2187,14 @@ async function executeTool(name, args, sender) {
                       result = `Stopped — hit ${block.name}!`;
                       return;
                     }
+                    // Switch to shovel for dirt/sand/gravel
+                    if (shovel && (block.name.includes('dirt') || block.name.includes('sand') || block.name.includes('gravel'))) {
+                      await bot.equip(shovel, 'hand');
+                    }
                     try {
                       await bot.dig(block);
                       dug++;
-                      await new Promise(r => setTimeout(r, 200));
+                      await new Promise(r => setTimeout(r, 600));
                     } catch (e) { break; }
                   }
                 }
@@ -2006,10 +2208,16 @@ async function executeTool(name, args, sender) {
                   result = `Stopped — hit ${belowBlock.name} below!`;
                   return;
                 }
+                // Switch to shovel for dirt/sand/gravel
+                if (shovel && (belowBlock.name.includes('dirt') || belowBlock.name.includes('sand') || belowBlock.name.includes('gravel'))) {
+                  await bot.equip(shovel, 'hand');
+                } else if (pickaxe) {
+                  await bot.equip(pickaxe, 'hand');
+                }
                 try {
                   await bot.dig(belowBlock);
                   dug++;
-                  await new Promise(r => setTimeout(r, 200));
+                  await new Promise(r => setTimeout(r, 600));
                 } catch (e) { break; }
               }
 
@@ -2021,19 +2229,41 @@ async function executeTool(name, args, sender) {
                   result = `Stopped — hit ${below2Block.name} below!`;
                   return;
                 }
+                // Switch to shovel for dirt/sand/gravel
+                if (shovel && (below2Block.name.includes('dirt') || below2Block.name.includes('sand') || below2Block.name.includes('gravel'))) {
+                  await bot.equip(shovel, 'hand');
+                } else if (pickaxe) {
+                  await bot.equip(pickaxe, 'hand');
+                }
                 try {
                   await bot.dig(below2Block);
                   dug++;
-                  await new Promise(r => setTimeout(r, 200));
+                  await new Promise(r => setTimeout(r, 600));
                 } catch (e) { break; }
               }
 
-              // Actually move the bot using controls (not fake position)
-              // Walk forward and drop down
-              bot.setControlState('forward', true);
-              await new Promise(r => setTimeout(r, 500));
-              bot.setControlState('forward', false);
-              await new Promise(r => setTimeout(r, 200));
+              // Actually move the bot — use pathfinder to walk to the next step position
+              const nextStepPos = bot.entity.position.offset(fwdX, -1, fwdZ);
+              try {
+                bot.pathfinder.setGoal(new pf.goals.GoalNear(nextStepPos.x, nextStepPos.y, nextStepPos.z, 1));
+                // Wait until bot arrives or timeout
+                await new Promise((resolve) => {
+                  const check = setInterval(() => {
+                    const dist = bot.entity.position.distanceTo(nextStepPos);
+                    if (dist < 2 || !bot.pathfinder?.goal) {
+                      clearInterval(check);
+                      resolve();
+                    }
+                  }, 300);
+                  setTimeout(() => { clearInterval(check); resolve(); }, 4000);
+                });
+              } catch (e) {
+                // Pathfinder failed, try raw movement
+                bot.setControlState('forward', true);
+                await new Promise(r => setTimeout(r, 1000));
+                bot.setControlState('forward', false);
+              }
+              await new Promise(r => setTimeout(r, 300));
 
               logBehavior(`staircase step ${s + 1}: y=${Math.round(bot.entity.position.y)}`);
             }
@@ -2404,17 +2634,76 @@ async function executeTool(name, args, sender) {
       case 'set_goal': {
         const goalText = args.goal || args.text || '';
         if (!goalText) { result = 'No goal specified'; break; }
+        goalTree = createNode(goalText);
         logBehavior(`set goal: ${goalText}`);
-        result = `Goal set: ${goalText}`;
-        await handleGoalSet(goalText);
+        result = `Goal set: "${goalText}" — now use add_step() to break it down`;
         break;
       }
 
       case 'cancel_goal': {
-        activeGoal.active = false;
-        activeGoal.description = '';
+        goalTree = null;
         logBehavior('cancelled goal');
         result = 'Goal cancelled';
+        break;
+      }
+
+      case 'add_step': {
+        if (!goalTree) { result = 'No active goal! Use set_goal() first.'; break; }
+        const stepText = args.text || args.description || '';
+        if (!stepText) { result = 'No step description'; break; }
+        const parentId = args.parent_id ? parseInt(args.parent_id) : null;
+        
+        let parentNode;
+        if (parentId) {
+          parentNode = findNode(goalTree, parentId);
+          if (!parentNode) { result = `Parent step ${parentId} not found`; break; }
+        } else {
+          // Add under current active leaf
+          parentNode = findActiveLeaf(goalTree) || goalTree;
+        }
+        
+        const newStep = createNode(stepText);
+        parentNode.children.push(newStep);
+        logBehavior(`added step: ${stepText} under "${parentNode.text}"`);
+        result = `Added step: "${stepText}" (id: ${newStep.id}) under "${parentNode.text}"`;
+        break;
+      }
+
+      case 'complete_step': {
+        if (!goalTree) { result = 'No active goal'; break; }
+        const stepId = parseInt(args.id);
+        if (!stepId) { result = 'No step ID'; break; }
+        const stepNode = findNode(goalTree, stepId);
+        if (!stepNode) { result = `Step ${stepId} not found`; break; }
+        stepNode.status = 'done';
+        autoCompleteParents(goalTree);
+        logBehavior(`completed step: ${stepNode.text}`);
+        const nextLeaf = findActiveLeaf(goalTree);
+        if (nextLeaf) {
+          result = `Done: "${stepNode.text}" → Next: "${nextLeaf.text}" (id: ${nextLeaf.id})`;
+        } else if (goalTree.status === 'done') {
+          result = `Done: "${stepNode.text}" → GOAL COMPLETE! 🎉`;
+        } else {
+          result = `Done: "${stepNode.text}" — all sub-steps complete`;
+        }
+        break;
+      }
+
+      case 'fail_step': {
+        if (!goalTree) { result = 'No active goal'; break; }
+        const failId = parseInt(args.id);
+        if (!failId) { result = 'No step ID'; break; }
+        const failNode = findNode(goalTree, failId);
+        if (!failNode) { result = `Step ${failId} not found`; break; }
+        failNode.status = 'failed';
+        autoCompleteParents(goalTree);
+        logBehavior(`failed step: ${failNode.text}`);
+        result = `Failed: "${failNode.text}"`;
+        break;
+      }
+
+      case 'get_goal': {
+        result = getGoalSummary();
         break;
       }
 
@@ -2496,33 +2785,6 @@ async function executeTool(name, args, sender) {
         break;
       }
 
-      case 'add_task': {
-        const text = args.text || args.description || args.task;
-        if (!text) { result = 'No task description'; break; }
-        const task = addTask(text);
-        logBehavior(`added task: ${text}`);
-        result = `Task added: "${text}" (${taskList.length}/${MAX_TASKS} tasks)`;
-        break;
-      }
-
-      case 'complete_task': {
-        const idOrText = args.id || args.text || args.task;
-        if (!idOrText) { result = 'No task ID or text'; break; }
-        const completed = completeTask(idOrText);
-        if (completed) {
-          logBehavior(`completed task: ${completed.text}`);
-          result = `Task done: "${completed.text}" (${taskList.filter(t => t.status === 'pending').length} remaining)`;
-        } else {
-          result = `Task not found: "${idOrText}"`;
-        }
-        break;
-      }
-
-      case 'get_tasks': {
-        result = getTaskSummary();
-        break;
-      }
-
       default:
         result = `Unknown tool: ${name}`;
     }
@@ -2560,7 +2822,7 @@ app.get('/status', (req, res) => {
     following: (() => { const f = MODES.find(m => m.name === 'follow_player'); return f?.active ? f.target : null; })(),
     mood: personality.mood,
     energy: personality.energy,
-    goal: activeGoal.active ? activeGoal.description : null,
+    goal: goalTree ? goalTree.text : null,
     busy: botBusy,
   });
 });
