@@ -407,57 +407,98 @@ const MODES = [
     update: async function (bot) {
       if (!this.active || this.targetY === null) return;
       if (!bot.entity || !bot.entity.position) return;
-
-      const now = Date.now();
-      if (now - this.lastStep < 2000) return; // 2s between steps
-      this.lastStep = now;
-
-      const currentY = Math.round(bot.entity.position.y);
-
-      // Check if we reached the target
-      if (currentY <= this.targetY + 1) {
-        console.log(`[Tunnel] Reached target Y=${this.targetY}!`);
-        bot.chat(`Done! Dug staircase to Y=${currentY}`);
-        this.active = false;
-        this.targetY = null;
-        return;
-      }
-
-      // Check inventory
-      const mainSlots = bot.inventory.slots.slice(9, 45);
-      const emptySlots = mainSlots.filter(s => s === null).length;
-      if (emptySlots <= 1) {
-        console.log('[Tunnel] Inventory full, stopping');
-        bot.chat('Inventory full! Stopping tunnel.');
-        this.active = false;
-        this.targetY = null;
-        return;
-      }
-
-      // Equip best tool
-      const pickaxe = bot.inventory.items().find(i => i.name.includes('pickaxe'));
-      const shovel = bot.inventory.items().find(i => i.name.includes('shovel'));
-      if (pickaxe) {
-        try { await bot.equip(pickaxe, 'hand'); } catch (e) {}
-      }
-
-      // Get facing direction
-      const yaw = bot.entity.yaw;
-      const fwdX = -Math.round(Math.sin(yaw));
-      const fwdZ = -Math.round(Math.cos(yaw));
-
-      // Safety check: look ahead for lava
-      const lookAheadPos = bot.entity.position.offset(fwdX * 3, -3, fwdZ * 3);
-      const lookAheadBlock = bot.blockAt(lookAheadPos);
-      if (lookAheadBlock && (lookAheadBlock.name === 'lava' || lookAheadBlock.name === 'void_air')) {
-        console.log(`[Tunnel] Stopped — detected ${lookAheadBlock.name} ahead!`);
-        bot.chat(`Stopped — detected ${lookAheadBlock.name} ahead!`);
-        this.active = false;
-        this.targetY = null;
-        return;
-      }
+      if (this.busy) return; // prevent re-entry
+      this.busy = true;
 
       try {
+        const now = Date.now();
+        if (now - this.lastStep < 2500) return; // 2.5s between steps
+        this.lastStep = now;
+
+        const currentY = Math.round(bot.entity.position.y);
+
+        // Check if we reached the target
+        if (currentY <= this.targetY + 1) {
+          console.log(`[Tunnel] Reached target Y=${this.targetY}!`);
+          bot.chat(`Done! Dug staircase to Y=${currentY}`);
+          this.active = false;
+          this.targetY = null;
+          return;
+        }
+
+        // Check inventory
+        const mainSlots = bot.inventory.slots.slice(9, 45);
+        const emptySlots = mainSlots.filter(s => s === null).length;
+        if (emptySlots <= 1) {
+          console.log('[Tunnel] Inventory full, stopping');
+          bot.chat('Inventory full! Stopping tunnel.');
+          this.active = false;
+          this.targetY = null;
+          return;
+        }
+
+        // STOP pathfinder so it doesn't interfere with digging
+        bot.pathfinder.setGoal(null);
+
+        // Equip best tool
+        const pickaxe = bot.inventory.items().find(i => i.name.includes('pickaxe'));
+        const shovel = bot.inventory.items().find(i => i.name.includes('shovel'));
+        if (pickaxe) {
+          try { await bot.equip(pickaxe, 'hand'); } catch (e) {}
+        }
+
+        // Get facing direction
+        const yaw = bot.entity.yaw;
+        const fwdX = -Math.round(Math.sin(yaw));
+        const fwdZ = -Math.round(Math.cos(yaw));
+
+        // Safety check: look ahead for lava
+        const lookAheadPos = bot.entity.position.offset(fwdX * 3, -3, fwdZ * 3);
+        const lookAheadBlock = bot.blockAt(lookAheadPos);
+        if (lookAheadBlock && (lookAheadBlock.name === 'lava' || lookAheadBlock.name === 'void_air')) {
+          console.log(`[Tunnel] Stopped — detected ${lookAheadBlock.name} ahead!`);
+          bot.chat(`Stopped — detected ${lookAheadBlock.name} ahead!`);
+          this.active = false;
+          this.targetY = null;
+          return;
+        }
+
+        // Helper: dig a single block with retry
+        async function digBlock(blockPos) {
+          const block = bot.blockAt(blockPos);
+          if (!block || block.name === 'air') return true; // already clear
+          if (block.name === 'lava' || block.name === 'water') return false;
+
+          // Switch to shovel for dirt/sand/gravel
+          if (shovel && (block.name.includes('dirt') || block.name.includes('sand') || block.name.includes('gravel'))) {
+            try { await bot.equip(shovel, 'hand'); } catch (e) {}
+          } else if (pickaxe) {
+            try { await bot.equip(pickaxe, 'hand'); } catch (e) {}
+          }
+
+          // Look at the block before digging
+          try {
+            await bot.lookAt(blockPos.offset(0.5, 0.5, 0.5));
+            await new Promise(r => setTimeout(r, 100));
+          } catch (e) {}
+
+          // Try to dig with retries
+          for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+              await bot.dig(block);
+              await new Promise(r => setTimeout(r, 400));
+              return true;
+            } catch (e) {
+              if (attempt < 2) {
+                await new Promise(r => setTimeout(r, 500));
+                // Re-equip tool in case it was lost
+                if (pickaxe) try { await bot.equip(pickaxe, 'hand'); } catch (e2) {}
+              }
+            }
+          }
+          return false; // failed after retries
+        }
+
         // Dig 2 blocks forward (2 wide) at head height and foot height
         for (let w = 0; w < 2; w++) {
           const sideX = w === 0 ? 0 : (fwdZ !== 0 ? 1 : 0);
@@ -465,20 +506,13 @@ const MODES = [
 
           for (let h = 0; h < 2; h++) {
             const digPos = bot.entity.position.offset(fwdX + sideX, h, fwdZ + sideZ);
-            const block = bot.blockAt(digPos);
-            if (block && block.name !== 'air') {
-              if (block.name === 'lava' || block.name === 'water') {
-                bot.chat(`Stopped — hit ${block.name}!`);
-                this.active = false;
-                this.targetY = null;
-                return;
-              }
-              // Switch to shovel for dirt/sand/gravel
-              if (shovel && (block.name.includes('dirt') || block.name.includes('sand') || block.name.includes('gravel'))) {
-                try { await bot.equip(shovel, 'hand'); } catch (e) {}
-              }
-              await bot.dig(block);
-              await new Promise(r => setTimeout(r, 500));
+            const success = await digBlock(digPos);
+            if (!success) {
+              console.log(`[Tunnel] Hit ${bot.blockAt(digPos)?.name || 'unknown'} at forward wall`);
+              bot.chat(`Stopped — hit ${bot.blockAt(digPos)?.name || 'unknown'}!`);
+              this.active = false;
+              this.targetY = null;
+              return;
             }
           }
         }
@@ -486,26 +520,18 @@ const MODES = [
         // Dig 2 blocks below (step down + headroom)
         for (let d = 1; d <= 2; d++) {
           const belowPos = bot.entity.position.offset(0, -d, 0);
-          const belowBlock = bot.blockAt(belowPos);
-          if (belowBlock && belowBlock.name !== 'air') {
-            if (belowBlock.name === 'lava' || belowBlock.name === 'water') {
-              bot.chat(`Stopped — hit ${belowBlock.name} below!`);
-              this.active = false;
-              this.targetY = null;
-              return;
-            }
-            // Switch to shovel for dirt/sand/gravel
-            if (shovel && (belowBlock.name.includes('dirt') || belowBlock.name.includes('sand') || belowBlock.name.includes('gravel'))) {
-              try { await bot.equip(shovel, 'hand'); } catch (e) {}
-            } else if (pickaxe) {
-              try { await bot.equip(pickaxe, 'hand'); } catch (e) {}
-            }
-            await bot.dig(belowBlock);
-            await new Promise(r => setTimeout(r, 500));
+          const success = await digBlock(belowPos);
+          if (!success) {
+            const belowBlock = bot.blockAt(belowPos);
+            console.log(`[Tunnel] Hit ${belowBlock?.name || 'unknown'} below`);
+            bot.chat(`Stopped — hit ${belowBlock?.name || 'unknown'} below!`);
+            this.active = false;
+            this.targetY = null;
+            return;
           }
         }
 
-        // Move forward and drop down using pathfinder
+        // Move forward and drop down
         const nextStepPos = bot.entity.position.offset(fwdX, -1, fwdZ);
         bot.pathfinder.setGoal(new pf.goals.GoalNear(nextStepPos.x, nextStepPos.y, nextStepPos.z, 1));
         await new Promise((resolve) => {
@@ -522,6 +548,8 @@ const MODES = [
         console.log(`[Tunnel] Step: Y=${Math.round(bot.entity.position.y)} (target: ${this.targetY})`);
       } catch (e) {
         console.log(`[Tunnel] Error: ${e.message}`);
+      } finally {
+        this.busy = false;
       }
     }
   }
