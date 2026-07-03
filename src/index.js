@@ -407,14 +407,13 @@ const MODES = [
     update: async function (bot) {
       if (!this.active || this.targetY === null) return;
       if (!bot.entity || !bot.entity.position) return;
-      if (this.busy) return; // prevent re-entry
+
+      const now = Date.now();
+      if (now - this.lastStep < 2500) return; // 2.5s between steps
+      this.lastStep = now;
       this.busy = true;
 
       try {
-        const now = Date.now();
-        if (now - this.lastStep < 2500) return; // 2.5s between steps
-        this.lastStep = now;
-
         const currentY = Math.round(bot.entity.position.y);
 
         // Check if we reached the target
