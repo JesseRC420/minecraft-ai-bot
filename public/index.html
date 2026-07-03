@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Minecraft AI Bot — Dashboard</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #1a1a2e; color: #e0e0e0; height: 100vh; overflow: hidden; }
+  
+  .header { background: #16213e; padding: 12px 20px; display: flex; align-items: center; gap: 16px; border-bottom: 2px solid #0f3460; }
+  .header h1 { font-size: 18px; color: #4ecca3; }
+  .status-badge { padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+  .status-online { background: #2d6a4f; color: #95d5b2; }
+  .status-offline { background: #6a2d2d; color: #d59595; }
+  .header-stats { margin-left: auto; display: flex; gap: 16px; font-size: 13px; color: #888; }
+  .header-stats span { display: flex; align-items: center; gap: 4px; }
+
+  .container { display: grid; grid-template-columns: 300px 1fr 280px; height: calc(100vh - 52px); }
+  
+  /* Left Panel — Goal Tree */
+  .panel { background: #16213e; border-right: 1px solid #0f3460; display: flex; flex-direction: column; }
+  .panel-header { padding: 12px 16px; font-weight: 600; font-size: 14px; color: #4ecca3; border-bottom: 1px solid #0f3460; display: flex; align-items: center; gap: 8px; }
+  .panel-content { flex: 1; overflow-y: auto; padding: 12px; }
+
+  /* Center — Chat */
+  .chat-panel { display: flex; flex-direction: column; }
+  .chat-messages { flex: 1; overflow-y: auto; padding: 16px; }
+  .chat-msg { margin-bottom: 12px; max-width: 80%; }
+  .chat-msg.player { margin-right: auto; }
+  .chat-msg.bot { margin-left: auto; }
+  .chat-msg .sender { font-size: 11px; color: #888; margin-bottom: 2px; }
+  .chat-msg .bubble { padding: 8px 12px; border-radius: 12px; font-size: 14px; line-height: 1.4; }
+  .chat-msg.player .bubble { background: #0f3460; color: #e0e0e0; border-bottom-left-radius: 4px; }
+  .chat-msg.bot .bubble { background: #2d6a4f; color: #e0e0e0; border-bottom-right-radius: 4px; }
+  .chat-msg.system .bubble { background: #3a3a5c; color: #aaa; font-style: italic; text-align: center; max-width: 100%; }
+  .chat-input { padding: 12px 16px; border-top: 1px solid #0f3460; display: flex; gap: 8px; }
+  .chat-input input { flex: 1; background: #1a1a2e; border: 1px solid #0f3460; color: #e0e0e0; padding: 8px 12px; border-radius: 8px; font-size: 14px; }
+  .chat-input button { background: #4ecca3; color: #1a1a2e; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-weight: 600; }
+  .chat-input button:hover { background: #3daa8a; }
+
+  /* Right Panel — Status */
+  .right-panel { border-left: 1px solid #0f3460; }
+  .stat-card { background: #1a1a2e; border-radius: 8px; padding: 12px; margin-bottom: 8px; }
+  .stat-card h3 { font-size: 12px; color: #4ecca3; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
+  .stat-row { display: flex; justify-content: space-between; font-size: 13px; padding: 3px 0; }
+  .stat-row .label { color: #888; }
+  .stat-row .value { color: #e0e0e0; font-weight: 500; }
+  
+  .bar { height: 6px; background: #1a1a2e; border-radius: 3px; overflow: hidden; margin-top: 4px; }
+  .bar-fill { height: 100%; border-radius: 3px; transition: width 0.5s; }
+  .bar-health .bar-fill { background: #e74c3c; }
+  .bar-food .bar-fill { background: #e67e22; }
+  .bar-energy .bar-fill { background: #3498db; }
+  
+  .mood-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; background: #3a3a5c; }
+  
+  /* Goal Tree */
+  .goal-empty { color: #666; font-style: italic; text-align: center; padding: 40px 20px; }
+  .goal-title { font-size: 14px; font-weight: 600; color: #4ecca3; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid #0f3460; }
+  .tree-node { padding: 4px 0; font-size: 13px; line-height: 1.6; }
+  .tree-node .icon { margin-right: 6px; }
+  .tree-node .icon.done { color: #2ecc71; }
+  .tree-node .icon.pending { color: #f39c12; }
+  .tree-node .icon.failed { color: #e74c3c; }
+  .tree-node.active { color: #4ecca3; font-weight: 600; }
+  .tree-indent { display: inline-block; width: 20px; color: #555; }
+  
+  /* Behavior Log */
+  .log-entry { font-size: 12px; padding: 4px 0; color: #888; border-bottom: 1px solid #1a1a2e; }
+  .log-entry .time { color: #555; margin-right: 6px; }
+  
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: #1a1a2e; }
+  ::-webkit-scrollbar-thumb { background: #0f3460; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #1a4a7a; }
+
+  /* Inventory grid */
+  .inv-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
+  .inv-item { background: #1a1a2e; padding: 4px; border-radius: 4px; font-size: 11px; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>⛏ Minecraft AI Bot</h1>
+  <span id="statusBadge" class="status-badge status-offline">OFFLINE</span>
+  <div class="header-stats">
+    <span id="hdrPos">📍 --</span>
+    <span id="hdrHealth">❤ --</span>
+    <span id="hdrFood">🍖 --</span>
+    <span id="hdrMood">😊 --</span>
+  </div>
+</div>
+
+<div class="container">
+  <!-- Left: Goal Tree -->
+  <div class="panel">
+    <div class="panel-header">🎯 Goal Tree</div>
+    <div class="panel-content" id="goalTree">
+      <div class="goal-empty">No active goal</div>
+    </div>
+    <div class="panel-header" style="margin-top: auto;">📋 Behavior Log</div>
+    <div class="panel-content" id="behaviorLog" style="max-height: 200px;"></div>
+  </div>
+
+  <!-- Center: Chat -->
+  <div class="chat-panel">
+    <div class="panel-header">💬 Chat</div>
+    <div class="chat-messages" id="chatMessages"></div>
+    <div class="chat-input">
+      <input type="text" id="chatInput" placeholder="Send a message to the bot..." />
+      <button onclick="sendChat()">Send</button>
+    </div>
+  </div>
+
+  <!-- Right: Status -->
+  <div class="panel right-panel">
+    <div class="panel-header">📊 Bot Status</div>
+    <div class="panel-content">
+      <div class="stat-card">
+        <h3>Vitals</h3>
+        <div class="stat-row"><span class="label">Health</span><span class="value" id="healthVal">--/20</span></div>
+        <div class="bar bar-health"><div class="bar-fill" id="healthBar" style="width:100%"></div></div>
+        <div class="stat-row"><span class="label">Food</span><span class="value" id="foodVal">--/20</span></div>
+        <div class="bar bar-food"><div class="bar-fill" id="foodBar" style="width:100%"></div></div>
+      </div>
+
+      <div class="stat-card">
+        <h3>State</h3>
+        <div class="stat-row"><span class="label">Position</span><span class="value" id="posVal">--</span></div>
+        <div class="stat-row"><span class="label">Mood</span><span class="value"><span class="mood-badge" id="moodVal">--</span></span></div>
+        <div class="stat-row"><span class="label">Energy</span><span class="value" id="energyVal">--</span></div>
+        <div class="bar bar-energy"><div class="bar-fill" id="energyBar" style="width:100%"></div></div>
+        <div class="stat-row"><span class="label">Busy</span><span class="value" id="busyVal">No</span></div>
+        <div class="stat-row"><span class="label">Following</span><span class="value" id="followVal">No</span></div>
+        <div class="stat-row"><span class="label">Tunneling</span><span class="value" id="tunnelVal">No</span></div>
+      </div>
+
+      <div class="stat-card">
+        <h3>Brain</h3>
+        <div class="stat-row"><span class="label">Emotion</span><span class="value" id="brainMood">--</span></div>
+        <div class="stat-row"><span class="label">Environment</span><span class="value" id="brainEnv">--</span></div>
+      </div>
+
+      <div class="stat-card">
+        <h3>Inventory</h3>
+        <div class="stat-row"><span class="label">Empty slots</span><span class="value" id="invEmpty">--</span></div>
+        <div class="inv-grid" id="invGrid"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const chatMessages = document.getElementById('chatMessages');
+  const chatInput = document.getElementById('chatInput');
+  let ws;
+  let chatHistory = [];
+
+  function connect() {
+    ws = new WebSocket(`ws://${location.host}`);
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      handleMessage(msg);
+    };
+    ws.onclose = () => setTimeout(connect, 3000);
+    ws.onerror = () => ws.close();
+  }
+
+  function handleMessage(msg) {
+    switch (msg.type) {
+      case 'init':
+      case 'status':
+        updateStatus(msg.data);
+        break;
+      case 'goal':
+        updateGoalTree(msg.data);
+        break;
+      case 'logs':
+        updateLogs(msg.data);
+        break;
+      case 'chat':
+        updateChat(msg.data);
+        break;
+      case 'inventory':
+        updateInventory(msg.data);
+        break;
+      case 'brain':
+        updateBrain(msg.data);
+        break;
+    }
+  }
+
+  function updateStatus(s) {
+    const badge = document.getElementById('statusBadge');
+    if (s.connected) {
+      badge.textContent = 'ONLINE';
+      badge.className = 'status-badge status-online';
+    } else {
+      badge.textContent = 'OFFLINE';
+      badge.className = 'status-badge status-offline';
+    }
+    document.getElementById('hdrPos').textContent = s.position ? `📍 ${s.position.join(', ')}` : '📍 --';
+    document.getElementById('hdrHealth').textContent = s.health !== undefined ? `❤ ${s.health}/20` : '❤ --';
+    document.getElementById('hdrFood').textContent = s.food !== undefined ? `🍖 ${s.food}/20` : '🍖 --';
+    document.getElementById('hdrMood').textContent = s.mood ? `😊 ${s.mood}` : '😊 --';
+    
+    document.getElementById('healthVal').textContent = s.health !== undefined ? `${s.health}/20` : '--/20';
+    document.getElementById('healthBar').style.width = s.health !== undefined ? `${(s.health/20)*100}%` : '100%';
+    document.getElementById('foodVal').textContent = s.food !== undefined ? `${s.food}/20` : '--/20';
+    document.getElementById('foodBar').style.width = s.food !== undefined ? `${(s.food/20)*100}%` : '100%';
+    document.getElementById('posVal').textContent = s.position ? s.position.join(', ') : '--';
+    document.getElementById('moodVal').textContent = s.mood || '--';
+    document.getElementById('energyVal').textContent = s.energy !== undefined ? `${s.energy}/100` : '--';
+    document.getElementById('energyBar').style.width = s.energy !== undefined ? `${s.energy}%` : '100%';
+    document.getElementById('busyVal').textContent = s.busy ? 'Yes' : 'No';
+    document.getElementById('followVal').textContent = s.following || 'No';
+    document.getElementById('tunnelVal').textContent = s.tunneling ? `To Y=${s.tunneling.targetY}` : 'No';
+  }
+
+  function updateGoalTree(data) {
+    const el = document.getElementById('goalTree');
+    if (!data.tree) {
+      el.innerHTML = '<div class="goal-empty">No active goal</div>';
+      return;
+    }
+    el.innerHTML = `<div class="goal-title">${esc(data.tree.text)}</div>` + renderNode(data.tree, 0, data.activeLeaf);
+  }
+
+  function renderNode(node, depth, activeLeaf) {
+    const icons = { done: '✓', failed: '✗', pending: '○' };
+    const icon = icons[node.status] || '?';
+    const isActive = activeLeaf && activeLeaf.id === node.id;
+    const cls = isActive ? 'active' : '';
+    let html = `<div class="tree-node ${cls}">`;
+    for (let i = 0; i < depth; i++) html += '<span class="tree-indent">│</span>';
+    html += `<span class="icon ${node.status}">${icon}</span>${esc(node.text)}`;
+    if (isActive) html += ' ◄';
+    html += '</div>';
+    for (const child of node.children) {
+      html += renderNode(child, depth + 1, activeLeaf);
+    }
+    return html;
+  }
+
+  function updateLogs(data) {
+    const el = document.getElementById('behaviorLog');
+    if (!data.behavior || data.behavior.length === 0) {
+      el.innerHTML = '<div style="color:#666;font-style:italic;">No activity yet</div>';
+      return;
+    }
+    el.innerHTML = data.behavior.slice(-15).reverse().map(b => {
+      const time = new Date(b.time).toLocaleTimeString();
+      return `<div class="log-entry"><span class="time">${time}</span>${esc(b.action)}</div>`;
+    }).join('');
+  }
+
+  function updateChat(messages) {
+    if (!messages) return;
+    // Only add new messages
+    const existing = chatHistory.length;
+    const newMsgs = messages.slice(existing);
+    for (const m of newMsgs) {
+      chatHistory.push(m);
+      addChatBubble(m);
+    }
+    // If we got fewer messages (reset), clear and redraw
+    if (messages.length < existing) {
+      chatHistory = messages;
+      chatMessages.innerHTML = '';
+      for (const m of messages) addChatBubble(m);
+    }
+  }
+
+  function addChatBubble(m) {
+    const div = document.createElement('div');
+    const isBot = m.isBot;
+    const isSystem = m.sender === 'system';
+    div.className = `chat-msg ${isSystem ? 'system' : isBot ? 'bot' : 'player'}`;
+    const time = new Date(m.time).toLocaleTimeString();
+    if (isSystem) {
+      div.innerHTML = `<div class="bubble">${esc(m.message)}</div>`;
+    } else {
+      div.innerHTML = `<div class="sender">${esc(m.sender)} · ${time}</div><div class="bubble">${esc(m.message)}</div>`;
+    }
+    chatMessages.appendChild(div);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
+
+  function updateInventory(data) {
+    document.getElementById('invEmpty').textContent = data.emptySlots ?? '--';
+    const grid = document.getElementById('invGrid');
+    if (!data.items || data.items.length === 0) {
+      grid.innerHTML = '<div style="color:#666;font-size:12px;">Empty</div>';
+      return;
+    }
+    // Group by name
+    const grouped = {};
+    for (const item of data.items) {
+      grouped[item.name] = (grouped[item.name] || 0) + item.count;
+    }
+    grid.innerHTML = Object.entries(grouped).slice(0, 16).map(([name, count]) =>
+      `<div class="inv-item" title="${esc(name)}">${esc(name.replace(/_/g, ' '))} ×${count}</div>`
+    ).join('');
+  }
+
+  function updateBrain(data) {
+    document.getElementById('brainMood').textContent = data.mood || '--';
+    document.getElementById('brainEnv').textContent = data.environment || '--';
+  }
+
+  function sendChat() {
+    const msg = chatInput.value.trim();
+    if (!msg) return;
+    chatInput.value = '';
+    fetch('/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: msg }),
+    });
+    // Optimistically add to chat
+    const m = { sender: 'You', message: msg, isBot: false, time: Date.now() };
+    chatHistory.push(m);
+    addChatBubble(m);
+  }
+
+  chatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendChat(); });
+
+  function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+
+  connect();
+</script>
+</body>
+</html>

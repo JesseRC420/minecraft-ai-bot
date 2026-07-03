@@ -1464,6 +1464,9 @@ function createBot() {
     // Start inner monologue loop
     startMonologueLoop();
 
+    // Hook chat capture for web UI
+    hookChatCapture();
+
     // Save periodically
     setInterval(() => {
       memoryData.personality = personality;
@@ -1703,7 +1706,8 @@ function startAutoPromptLoop() {
 // INNER MONOLOGUE — Bot reflects and thinks during idle periods
 // ══════════════════════════════════════════════════════════════════════════════
 
-let lastMonologue = 0;
+let lastMonologueText = '';
+let lastMonologueTime = 0;
 
 function startMonologueLoop() {
   setInterval(async () => {
@@ -1712,10 +1716,10 @@ function startMonologueLoop() {
 
     const now = Date.now();
     // Every 60-90 seconds, have a thought
-    if (now - lastMonologue < 60000) return;
+    if (now - lastMonologueTime < 60000) return;
     if (Math.random() > 0.4) return; // 40% chance
 
-    lastMonologue = now;
+    lastMonologueTime = now;
 
     try {
       const monologuePrompt = livingBrain.getMonologuePrompt();
@@ -1723,6 +1727,8 @@ function startMonologueLoop() {
       const parsed = parseLLMResponse(response);
       if (parsed.text && parsed.text.length > 3) {
         console.log(`[Monologue] ${parsed.text}`);
+        lastMonologueText = parsed.text;
+        addChatMessage('brain', `*${parsed.text}*`, true);
         // Don't always say it out loud — sometimes just think it
         if (Math.random() < 0.5) {
           bot.chat(`*${parsed.text}*`);
@@ -1748,6 +1754,7 @@ async function handlePlayerMessage(username, message) {
   botBusy = true;
 
   console.log(`[Handler] Processing message from ${username}: "${message}"`);
+  addChatMessage(username, message, false);
 
   try {
     logBehavior(`received message from ${username}: ${message}`);
@@ -1812,6 +1819,7 @@ async function handlePlayerMessage(username, message) {
             // Just a chat message
             const reply = followUpParsed.text || followUp || 'Done!';
             bot.chat(reply.substring(0, 200));
+            addChatMessage(MC_USERNAME, reply.substring(0, 200), true);
             logBehavior(`said: ${reply}`);
           }
         } catch (e) {
@@ -1838,11 +1846,13 @@ async function handlePlayerMessage(username, message) {
       // No tool call — send as chat
       const chatMsg = parsed.text.substring(0, 200);
       bot.chat(chatMsg);
+      addChatMessage(MC_USERNAME, chatMsg, true);
       logBehavior(`said: ${chatMsg}`);
     }
   } catch (e) {
     console.error('[LLM] Error:', e.message);
     bot.chat('Sorry, I had a brain hiccup!');
+    addChatMessage(MC_USERNAME, 'Sorry, I had a brain hiccup!', true);
   } finally {
     chatLock = false;
     botBusy = false;
@@ -2883,8 +2893,130 @@ app.get('/memory', (req, res) => {
   });
 });
 
-app.listen(SERVER_PORT, () => {
-  console.log(`[Server] HTTP API running on http://localhost:${SERVER_PORT}`);
+// ── NEW: Goal tree, logs, chat history for web UI ─────────────────────────
+
+app.get('/goal', (req, res) => {
+  res.json({
+    tree: goalTree,
+    summary: getGoalSummary(),
+    activeLeaf: findActiveLeaf(goalTree),
+  });
+});
+
+app.get('/logs', (req, res) => {
+  res.json({
+    behavior: behaviorLog.slice(-50),
+    monologue: lastMonologueText || null,
+  });
+});
+
+// Chat history (stored in memory)
+let chatHistory = [];
+const MAX_CHAT_HISTORY = 100;
+
+function addChatMessage(sender, message, isBot = false) {
+  chatHistory.push({ sender, message, isBot, time: Date.now() });
+  if (chatHistory.length > MAX_CHAT_HISTORY) chatHistory.shift();
+}
+
+app.get('/chat-history', (req, res) => {
+  res.json(chatHistory.slice(-50));
+});
+
+// ── Serve static files ───────────────────────────────────────────────────
+
+app.use(express.static(path.join(__dirname, '..', 'public')));
+
+// ── WebSocket for real-time updates ──────────────────────────────────────
+
+const WebSocket = require('ws');
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+const clients = new Set();
+
+wss.on('connection', (ws) => {
+  clients.add(ws);
+  console.log('[WS] Client connected');
+
+  // Send initial state
+  ws.send(JSON.stringify({ type: 'init', data: {
+    status: bot && bot.entity ? {
+      connected: true,
+      username: MC_USERNAME,
+      position: [Math.round(bot.entity.position.x), Math.round(bot.entity.position.y), Math.round(bot.entity.position.z)],
+      health: Math.round(bot.health),
+      food: Math.round(bot.food),
+    } : { connected: false },
+    goal: goalTree,
+  }}));
+
+  ws.on('close', () => {
+    clients.delete(ws);
+    console.log('[WS] Client disconnected');
+  });
+});
+
+function broadcast(type, data) {
+  const msg = JSON.stringify({ type, data });
+  for (const client of clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msg);
+    }
+  }
+}
+
+// Broadcast updates every 2 seconds
+setInterval(() => {
+  if (clients.size === 0) return;
+  if (!bot || !bot.entity) return;
+
+  broadcast('status', {
+    connected: true,
+    username: MC_USERNAME,
+    position: [Math.round(bot.entity.position.x), Math.round(bot.entity.position.y), Math.round(bot.entity.position.z)],
+    health: Math.round(bot.health),
+    food: Math.round(bot.food),
+    sleeping: MODES.find(m => m.name === 'sleep')?.sleeping || false,
+    following: (() => { const f = MODES.find(m => m.name === 'follow_player'); return f?.active ? f.target : null; })(),
+    tunneling: (() => { const t = MODES.find(m => m.name === 'tunnel'); return t?.active ? { targetY: t.targetY, currentY: Math.round(bot.entity.position.y) } : null; })(),
+    mood: personality.mood,
+    energy: personality.energy,
+    boredom: personality.boredom,
+    busy: botBusy,
+  });
+
+  broadcast('goal', { tree: goalTree, summary: getGoalSummary() });
+  broadcast('logs', { behavior: behaviorLog.slice(-20), monologue: lastMonologue });
+  broadcast('chat', chatHistory.slice(-20));
+  broadcast('inventory', {
+    items: bot.inventory.items().map(i => ({ name: i.name, count: i.count })),
+    emptySlots: bot.inventory.emptySlotCount(),
+  });
+  if (livingBrain) {
+    broadcast('brain', {
+      mood: livingBrain.emotional.dominant,
+      moodValue: Math.round(livingBrain.emotional.mood[livingBrain.emotional.dominant] * 100),
+      description: livingBrain.emotional.describe(),
+      environment: livingBrain.sensory.environment,
+    });
+  }
+}, 2000);
+
+// Hook into chat to capture messages
+const origHandlePlayerMessage = handlePlayerMessage;
+// Wrap bot chat event to capture messages
+function hookChatCapture() {
+  if (!bot) return;
+  bot.on('chat', (username, message) => {
+    if (username === MC_USERNAME) return; // Don't capture own messages
+    addChatMessage(username, message, false);
+  });
+}
+
+server.listen(SERVER_PORT, () => {
+  console.log(`[Server] HTTP API + WebSocket running on http://localhost:${SERVER_PORT}`);
+  console.log(`[Server] Web UI: http://localhost:${SERVER_PORT}/index.html`);
 });
 
 // ══════════════════════════════════════════════════════════════════════════════

@@ -13,6 +13,7 @@
     "mineflayer-pathfinder": "^2.4.5",
     "pngjs": "^7.0.0",
     "prismarine-viewer": "^1.28.0",
-    "uuid": "^9.0.0"
+    "uuid": "^9.0.0",
+    "ws": "^8.21.0"
   }
 }
