@@ -27,12 +27,25 @@ const { LivingBrain } = require('./livingbrain');
 const { PersistentMemory } = require('./memory');
 
 // ── Configuration ──────────────────────────────────────────────────────────
-const MC_HOST = process.env.MC_HOST || 'localhost';
-const MC_PORT = parseInt(process.env.MC_PORT) || 25565;
-const MC_USERNAME = process.env.MC_USERNAME || 'AIBot';
-const MC_VERSION = process.env.MC_VERSION || '1.21';
-const LLM_BASE_URL = process.env.LLM_BASE_URL || 'http://127.0.0.1:1234';
-const SERVER_PORT = parseInt(process.env.SERVER_PORT) || 8080;
+const CONFIG_FILE = path.join(__dirname, '..', 'config.json');
+let config;
+try {
+  config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+} catch (e) {
+  console.error('[Config] Failed to load config.json, using defaults');
+  config = {};
+}
+
+const MC_HOST = process.env.MC_HOST || config.minecraft?.host || 'localhost';
+const MC_PORT = parseInt(process.env.MC_PORT) || config.minecraft?.port || 25565;
+const MC_USERNAME = process.env.MC_USERNAME || config.minecraft?.username || 'AIBot';
+const MC_VERSION = process.env.MC_VERSION || config.minecraft?.version || '1.21';
+const LLM_BASE_URL = process.env.LLM_BASE_URL || config.llm?.baseUrl || 'http://127.0.0.1:1234';
+const LLM_API_ENDPOINT = config.llm?.apiEndpoint || '/api/v1/chat';
+const LLM_MODEL = config.llm?.model || 'nvidia/nemotron-3-nano-4b';
+const LLM_CONTEXT_LENGTH = config.llm?.contextLength || 4096;
+const LLM_TEMPERATURE = config.llm?.temperature || 0.7;
+const SERVER_PORT = parseInt(process.env.SERVER_PORT) || config.server?.port || 8080;
 const MEMORY_FILE = path.join(__dirname, '..', 'memory.json');
 
 // ── mcData Cache (NEW: avoids repeated require('minecraft-data') calls) ────
@@ -182,7 +195,9 @@ const MODES = [
       if (this.sleeping) {
         if (!isNight) {
           // Morning! Wake up
-          try { bot.wake(); } catch (e) {}
+          if (bot.player?.sleeping) {
+            try { bot.wake(); } catch (e) {}
+          }
           this.sleeping = false;
           console.log('[Sleep] Woke up — morning!');
         }
@@ -439,6 +454,53 @@ function pickRandom(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 // ══════════════════════════════════════════════════════════════════════════════
 
 // ══════════════════════════════════════════════════════════════════════════════
+// TASK LIST — LLM's working memory for multi-step goals
+// ══════════════════════════════════════════════════════════════════════════════
+
+const MAX_TASKS = 8;
+const taskList = []; // { id, text, status: 'pending'|'done', createdAt }
+
+function addTask(text) {
+  if (taskList.length >= MAX_TASKS) {
+    // Remove oldest completed tasks first, then oldest pending
+    const doneIdx = taskList.findIndex(t => t.status === 'done');
+    if (doneIdx >= 0) taskList.splice(doneIdx, 1);
+    else taskList.shift();
+  }
+  const task = { id: Date.now(), text, status: 'pending', createdAt: Date.now() };
+  taskList.push(task);
+  return task;
+}
+
+function completeTask(idOrText) {
+  // Try matching by ID first, then by partial text
+  let idx = taskList.findIndex(t => t.id === Number(idOrText));
+  if (idx < 0) idx = taskList.findIndex(t => t.text.toLowerCase().includes(String(idOrText).toLowerCase()));
+  if (idx < 0) return null;
+  taskList[idx].status = 'done';
+  return taskList[idx];
+}
+
+function getTaskSummary() {
+  if (taskList.length === 0) return 'No active tasks.';
+  return taskList.map((t, i) =>
+    `${i + 1}. [${t.status === 'done' ? 'x' : ' '}] ${t.text}`
+  ).join('\n');
+}
+
+function cleanOldTasks() {
+  const now = Date.now();
+  for (let i = taskList.length - 1; i >= 0; i--) {
+    if (taskList[i].status === 'done' && now - taskList[i].createdAt > 300000) {
+      taskList.splice(i, 1); // Remove done tasks after 5 minutes
+    }
+  }
+}
+
+// Clean old tasks every 60s
+setInterval(cleanOldTasks, 60000);
+
+// ══════════════════════════════════════════════════════════════════════════════
 // TOOL NAME ALIASES — LLM sometimes invents names, map them to real tools
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -465,12 +527,21 @@ const TOOL_ALIASES = {
   make_item: 'craft',
   build_pillar: 'pillar_up',
   nerd_pole: 'pillar_up',
+  add_todo: 'add_task',
+  create_task: 'add_task',
+  new_task: 'add_task',
+  mark_done: 'complete_task',
+  finish_task: 'complete_task',
+  done: 'complete_task',
+  list_tasks: 'get_tasks',
+  show_tasks: 'get_tasks',
+  tasks: 'get_tasks',
 };
 
 function parseLLMResponse(raw) {
   if (!raw || typeof raw !== 'string') return { text: '', tool: null };
 
-  // Strip control tokens (<think>, </think>, <tool_call>, </think>, <function>, </function>, etc.)
+  // Strip control tokens
   let cleaned = raw
     .replace(/<think>[\s\S]*?<\/think>/gi, '')
     .replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, '')
@@ -478,9 +549,65 @@ function parseLLMResponse(raw) {
     .replace(/<\/tool_call>\s*/gi, '')
     .replace(/<function>\s*/gi, '')
     .replace(/<\/function>\s*/gi, '')
+    .replace(/<\|channel\|>commentary to=\w+\s*/gi, '')
     .trim();
 
-  // Try JSON object: {"tool": "name", "param": "val"}
+  // ── FORMAT 1: XML <invoke name="tool"><arg name="key">val</arg></invoke> ──
+  const invokeMatch = cleaned.match(/<invoke\s+name="(\w+)">([\s\S]*?)<\/invoke>/i);
+  if (invokeMatch) {
+    const toolName = TOOL_ALIASES[invokeMatch[1]] || invokeMatch[1];
+    const args = {};
+    const argMatches = invokeMatch[2].matchAll(/<arg\s+name="(\w+)">([\s\S]*?)<\/arg>/gi);
+    for (const m of argMatches) {
+      args[m[1]] = m[2].trim().replace(/^["']|["']$/g, '');
+    }
+    const textBefore = cleaned.substring(0, cleaned.indexOf('<invoke')).trim();
+    return { text: textBefore, tool: { name: toolName, args } };
+  }
+
+  // ── FORMAT 2: XML self-closing <tool key="val" /> ────────────────────────
+  const VALID_TOOLS = new Set(['chat', 'goto', 'mine', 'chop', 'dig', 'place', 'equip', 'unequip',
+    'eat', 'craft', 'attack', 'hunt', 'shear', 'drop', 'look', 'interact', 'use_block',
+    'set_goal', 'cancel_goal', 'pillar_up', 'stop', 'idle', 'add_task', 'complete_task', 'get_tasks']);
+
+  const selfCloseMatch = cleaned.match(/<(\w+)\s+([^>]*?)\/?>/i);
+  if (selfCloseMatch) {
+    const tag = selfCloseMatch[1];
+    if (VALID_TOOLS.has(tag)) {
+      const toolName = TOOL_ALIASES[tag] || tag;
+      const args = {};
+      const attrMatches = selfCloseMatch[2].matchAll(/(\w+)="([^"]*)"/g);
+      for (const m of attrMatches) {
+        args[m[1]] = m[2].trim();
+      }
+      const textBefore = cleaned.substring(0, cleaned.indexOf(`<${tag}`)).trim();
+      return { text: textBefore, tool: { name: toolName, args } };
+    }
+  }
+
+  // ── FORMAT 3: XML child elements <tool><key>val</key></tool> ──────────────
+  const xmlChildMatch = cleaned.match(/<(\w+)>([\s\S]*?)<\/\1>/i);
+  if (xmlChildMatch) {
+    const tag = xmlChildMatch[1];
+    if (VALID_TOOLS.has(tag)) {
+      const toolName = TOOL_ALIASES[tag] || tag;
+      const inner = xmlChildMatch[2];
+      const args = {};
+      const childMatches = inner.matchAll(/<(\w+)>([\s\S]*?)<\/\1>/g);
+      let hasChildren = false;
+      for (const m of childMatches) {
+        args[m[1]] = m[2].trim().replace(/^["']|["']$/g, '');
+        hasChildren = true;
+      }
+      if (!hasChildren && inner.trim()) {
+        args[guessArgName(tag)] = inner.trim();
+      }
+      const textBefore = cleaned.substring(0, cleaned.indexOf(`<${tag}>`)).trim();
+      return { text: textBefore, tool: { name: toolName, args } };
+    }
+  }
+
+  // ── FORMAT 4: JSON object: {"tool": "name", "param": "val"} ─────────────
   try {
     const jsonMatch = cleaned.match(/\{[\s\S]*"tool"[\s\S]*\}/);
     if (jsonMatch) {
@@ -488,15 +615,17 @@ function parseLLMResponse(raw) {
       if (obj.tool) {
         const args = { ...obj };
         delete args.tool;
-        return { text: obj.text || '', tool: { name: obj.tool, args } };
+        const name = TOOL_ALIASES[obj.tool] || obj.tool;
+        return { text: obj.text || '', tool: { name, args } };
       }
     }
   } catch (e) { /* not valid JSON */ }
 
-  // Try tool_name(arg:val, arg:val) format
+  // ── FORMAT 5: tool_name(arg:val, arg:val) ────────────────────────────────
   const toolMatch = cleaned.match(/(\w+)\s*\(([^)]*)\)/);
   if (toolMatch) {
-    const toolName = toolMatch[1];
+    let toolName = toolMatch[1];
+    toolName = TOOL_ALIASES[toolName] || toolName;
     const argStr = toolMatch[2];
     const args = {};
     if (argStr) {
@@ -504,50 +633,243 @@ function parseLLMResponse(raw) {
       for (const pair of pairs) {
         const [key, ...valParts] = pair.split(':');
         if (key && valParts.length) {
-          let val = valParts.join(':').trim();
-          // Remove quotes
-          val = val.replace(/^["']|["']$/g, '');
+          let val = valParts.join(':').trim().replace(/^["']|["']$/g, '');
           args[key.trim()] = val;
         }
       }
     }
     const textBefore = cleaned.substring(0, cleaned.indexOf(toolMatch[0])).trim();
-    const normalized = TOOL_ALIASES[toolName] || toolName;
-    return { text: textBefore, tool: { name: normalized, args } };
+    return { text: textBefore, tool: { name: toolName, args } };
   }
 
-  // Try function_call format: {"name": "func", "arguments": {...}}
+  // ── FORMAT 6: function_call format: {"name": "func", "arguments": {...}} ─
   try {
     const fnMatch = cleaned.match(/\{[\s\S]*"name"[\s\S]*"arguments"[\s\S]*\}/);
     if (fnMatch) {
       const obj = JSON.parse(fnMatch[0]);
       if (obj.name) {
         const args = typeof obj.arguments === 'string' ? JSON.parse(obj.arguments) : (obj.arguments || {});
-        return { text: obj.text || '', tool: { name: obj.name, args } };
+        const name = TOOL_ALIASES[obj.name] || obj.name;
+        return { text: obj.text || '', tool: { name, args } };
       }
     }
   } catch (e) { /* not valid */ }
 
-  // Try "tool_name: arg1, arg2" format
-  const simpleMatch = cleaned.match(/^(\w+):\s*(.+)/);
-  if (simpleMatch && simpleMatch[1].length < 30) {
-    const toolName = simpleMatch[1];
-    const argsStr = simpleMatch[2];
-    const args = {};
-    const parts = argsStr.split(',').map(s => s.trim());
-    for (const part of parts) {
-      const eqIdx = part.indexOf('=');
-      if (eqIdx > 0) {
-        args[part.substring(0, eqIdx).trim()] = part.substring(eqIdx + 1).trim().replace(/^["']|["']$/g, '');
+  // ── FORMAT 6b: {"tool_call": {"action": "name", ...}} ────────────────────
+  try {
+    const tcMatch = cleaned.match(/\{[\s\S]*"tool_call"[\s\S]*\}/);
+    if (tcMatch) {
+      const obj = JSON.parse(tcMatch[0]);
+      if (obj.tool_call) {
+        const tc = obj.tool_call;
+        const rawName = tc.action || tc.tool || tc.name || '';
+        const name = TOOL_ALIASES[rawName] || rawName;
+        const args = { ...tc };
+        delete args.action;
+        delete args.tool;
+        delete args.name;
+        return { text: obj.text || '', tool: { name, args } };
       }
     }
-    if (Object.keys(args).length > 0) {
-      return { text: '', tool: { name: toolName, args } };
+  } catch (e) { /* not valid */ }
+
+  // ── FORMAT 7: Simple "tool: value" ───────────────────────────────────────
+  const simpleMatch = cleaned.match(/^(\w+):\s*(.+)/);
+  if (simpleMatch && simpleMatch[1].length < 30) {
+    const toolName = TOOL_ALIASES[simpleMatch[1]] || simpleMatch[1];
+    if (VALID_TOOLS.has(toolName)) {
+      return { text: '', tool: { name: toolName, args: { message: simpleMatch[2].trim() } } };
     }
   }
 
-  // No tool found — return as plain text (will be sent as chat)
+  // ── FORMAT 8: Bare tool name (just "chop" or "stop" with no args) ────────
+  const bareMatch = cleaned.match(/^(\w+)$/m);
+  if (bareMatch) {
+    const toolName = TOOL_ALIASES[bareMatch[1]] || bareMatch[1];
+    if (VALID_TOOLS.has(toolName)) {
+      return { text: '', tool: { name: toolName, args: {} } };
+    }
+  }
+
   return { text: cleaned, tool: null };
+}
+
+// Guess which argument a single value should go in
+function guessArgName(toolName) {
+  const map = {
+    chat: 'message', message: 'message',
+    goto: 'x', mine: 'block', craft: 'item', drop: 'item',
+    attack: 'target', hunt: 'animal', equip: 'item',
+    use_block: 'block', place: 'block', dig: 'direction',
+    add_task: 'text', complete_task: 'id',
+  };
+  return map[toolName] || 'value';
+}
+
+// Resolve partial item name to full inventory item name
+// e.g. "planks" → "oak_planks", "pickaxe" → "wooden_pickaxe", "stone" → "stone" (if exact match)
+function resolveItemName(name, bot) {
+  if (!name || !bot) return name;
+  const inv = bot.inventory.items();
+  
+  // Exact match first
+  if (inv.find(i => i.name === name)) return name;
+  
+  // Partial match — find first item containing the search term
+  const lower = name.toLowerCase();
+  const match = inv.find(i => i.name.toLowerCase().includes(lower));
+  if (match) return match.name;
+  
+  // No match — return original (will fail gracefully)
+  return name;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INVENTORY HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Check if inventory is full (36 main slots)
+function isInventoryFull(bot) {
+  if (!bot || !bot.inventory) return false;
+  const mainSlots = bot.inventory.slots.slice(9, 45); // slots 9-44 are main inventory
+  const emptySlots = mainSlots.filter(s => s === null).length;
+  return emptySlots <= 1; // 1 or fewer empty slots = basically full
+}
+
+// Count empty inventory slots
+function emptySlotCount(bot) {
+  if (!bot || !bot.inventory) return 0;
+  const mainSlots = bot.inventory.slots.slice(9, 45);
+  return mainSlots.filter(s => s === null).length;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HOME SYSTEM
+// ══════════════════════════════════════════════════════════════════════════════
+
+let homePosition = null; // { x, y, z }
+
+function setHome(pos) {
+  homePosition = { x: Math.round(pos.x), y: Math.round(pos.y), z: Math.round(pos.z) };
+  console.log(`[Home] Set home to ${homePosition.x}, ${homePosition.y}, ${homePosition.z}`);
+}
+
+function getHome() {
+  return homePosition;
+}
+
+// Get items already in a chest
+function getChestContents(chestWindow) {
+  const contents = {};
+  for (const slot of chestWindow.slots) {
+    if (slot) {
+      contents[slot.name] = (contents[slot.name] || 0) + slot.count;
+    }
+  }
+  return contents;
+}
+
+// Check if chest has room for more items
+function chestHasRoom(chestWindow) {
+  return chestWindow.slots.some(s => s === null);
+}
+
+// Deposit items into chest — only items that match what's already there
+async function depositItems(bot, chestBlock) {
+  const KEEP_ITEMS = new Set([
+    'crafting_table', 'torch', 'oak_door', 'spruce_door', 'birch_door',
+    'jungle_door', 'acacia_door', 'dark_oak_door',
+  ]);
+
+  // Find chest if not provided
+  if (!chestBlock) {
+    chestBlock = bot.findBlock({
+      matching: (b) => b.name === 'chest' || b.name === 'trapped_chest',
+      maxDistance: 16,
+      count: 1,
+    });
+  }
+
+  // No chest found — try to place one
+  if (!chestBlock) {
+    const chestItem = bot.inventory.items().find(i => i.name === 'chest');
+    if (!chestItem) return 'No chest nearby and no chest in inventory to place';
+
+    // Find a spot to place the chest (2 blocks in front of bot)
+    const yaw = bot.entity.yaw;
+    const placePos = bot.entity.position.offset(
+      -Math.round(Math.sin(yaw)) * 2,
+      0,
+      -Math.round(Math.cos(yaw)) * 2
+    );
+    const placeBlock = bot.blockAt(placePos.offset(0, -1, 0));
+
+    if (placeBlock && placeBlock.name !== 'air') {
+      await bot.equip(chestItem, 'hand');
+      await bot.placeBlock(placeBlock, new Vec3(0, 1, 0));
+      chestBlock = bot.blockAt(placePos);
+      await new Promise(r => setTimeout(r, 500));
+    } else {
+      return 'No solid block to place chest on';
+    }
+  }
+
+  // Open chest
+  const chestWindow = await bot.openChest(chestBlock);
+  await new Promise(r => setTimeout(r, 500));
+
+  // Get what's already in the chest
+  const chestContents = getChestContents(chestWindow);
+  const chestTypes = Object.keys(chestContents);
+
+  let deposited = 0;
+  const items = bot.inventory.items();
+
+  for (const item of items) {
+    // Skip tools, weapons, armor, and essentials
+    if (item.name.includes('pickaxe') || item.name.includes('axe') ||
+        item.name.includes('sword') || item.name.includes('shovel') ||
+        item.name.includes('bow') || item.name.includes('crossbow') ||
+        item.name.includes('shield') || item.name.includes('helmet') ||
+        item.name.includes('chestplate') || item.name.includes('leggings') ||
+        item.name.includes('boots') || item.name.includes('elytra') ||
+        KEEP_ITEMS.has(item.name)) {
+      continue;
+    }
+
+    // Only deposit items that match what's already in this chest
+    if (chestTypes.length > 0 && !chestTypes.includes(item.name)) {
+      continue;
+    }
+
+    // Check if chest has room
+    if (!chestHasRoom(chestWindow)) {
+      break;
+    }
+
+    try {
+      await chestWindow.deposit(item.type, null, item.count);
+      deposited += item.count;
+      chestContents[item.name] = (chestContents[item.name] || 0) + item.count;
+      await new Promise(r => setTimeout(r, 200));
+    } catch (e) {
+      // Chest might be full or can't accept this item
+      break;
+    }
+  }
+
+  bot.closeWindow(chestWindow);
+
+  if (chestTypes.length === 0) {
+    // Chest was empty — deposit everything
+    return deposited > 0
+      ? `Deposited ${deposited} items into new chest (now storing: ${Object.keys(chestContents).join(', ')})`
+      : 'Nothing to deposit';
+  }
+
+  return deposited > 0
+    ? `Deposited ${deposited} items matching chest contents (${chestTypes.join(', ')})`
+    : `No matching items to deposit (chest has: ${chestTypes.join(', ')})`;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -561,7 +883,7 @@ TOOLS (call one per response):
 - goto(x:number, y:number, z:number) — walk to coordinates
 - mine(block:"name", count:number) — find and mine blocks nearby
 - chop(count:number) — chop nearest tree for wood
-- dig(direction:"down"|"up"|"forward", count:number) — dig in a direction
+- dig(direction:"staircase"|"forward"|"up", count:number, y:number) — dig in a direction. Use staircase to dig a 2-wide, 2-tall staircase down. NEVER dig straight down (you'll fall into lava/caves)!
 - place(block:"name", x:number, y:number, z:number) — place a block FROM YOUR INVENTORY at coordinates (NOTE: tool name is "place" not "place_block")
 - equip(item:"name") — equip item to hand
 - unequip() — unequip held item
@@ -579,6 +901,17 @@ TOOLS (call one per response):
 - pillar_up(count:number) — build a nerd pole beneath you
 - stop() — stop all movement
 - idle() — do nothing, just chat
+
+HOME & STORAGE:
+- set_home() — save current location as home (where your chests are)
+- go_home() — walk back to your saved home
+- deposit() — put items in a nearby chest (keeps tools, deposits everything else)
+- check_inventory() — check how many empty slots you have (use before long tasks)
+
+TASK MANAGEMENT (use these to plan multi-step work):
+- add_task(text:"description") — add a task to your list (max 8 tasks)
+- complete_task(id:"text or number") — mark a task as done
+- get_tasks() — view your current task list
 
 ANIMAL DROPS:
 - sheep: wool (or shear for colored wool without killing), raw_mutton
@@ -735,6 +1068,10 @@ CURRENT STATE:
 - Following: ${(() => { const f = MODES.find(m => m.name === 'follow_player'); return f?.active ? `YES — following ${f.target} (say "stop" to stop)` : 'no'; })()}
 - Held: ${heldItem}
 
+YOUR TASKS:
+${getTaskSummary()}
+When the player asks for something complex (build, craft multi-step, gather resources), break it into tasks using add_task(), then complete each step with complete_task(). This helps you stay on track.
+
 YOUR INVENTORY (${inventory.length} items total):
 ${invSummary}
 
@@ -786,7 +1123,9 @@ ${persistentMemory ? persistentMemory.getMemoryContext() : '(Memory offline)'}
 
 ${getToolDefinitions()}
 
-Be helpful, friendly, and act like a real Minecraft player. When asked to do something, DO IT immediately with the tool call. Don't explain what you're going to do — just do it.`;
+Be helpful, friendly, and act like a real Minecraft player. When asked to do something, DO IT immediately with the tool call. Don't explain what you're going to do — just do it.
+
+IMPORTANT: If the player asks a conversational question (like "what do you want to do", "how are you", "what's up"), use chat() FIRST to respond naturally. Only use tools for actual tasks (mine, craft, build, go somewhere, etc).`;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1260,16 +1599,34 @@ async function handlePlayerMessage(username, message) {
       if (persistentMemory) persistentMemory.onToolUse(parsed.tool.name, toolResult, true);
 
       // Skip follow-up for chat/stop/idle — they already said what they wanted
-      const noFollowUp = ['chat', 'stop', 'idle'];
+      const noFollowUp = ['chat', 'stop', 'idle', 'complete_task', 'get_tasks'];
       if (!noFollowUp.includes(parsed.tool.name)) {
         // Send tool result back to LLM for a natural follow-up response
-        const followUpPrompt = `You just performed this action for player ${username}:\nTool: ${parsed.tool.name}(${JSON.stringify(parsed.tool.args)})\nResult: ${toolResult}\n\nNow respond to the player with a short message about what you did or what happened. Keep it under 100 chars. Just the message, no tool calls.`;
+        let followUpPrompt;
+        if (parsed.tool.name === 'add_task') {
+          followUpPrompt = `You just added a task: "${parsed.tool.args.text}". Now execute it immediately. Call the tool like: craft(item:"wooden_pickaxe") — just the tool call, nothing else.`;
+        } else {
+          followUpPrompt = `You just performed this action for player ${username}:\nTool: ${parsed.tool.name}(${JSON.stringify(parsed.tool.args)})\nResult: ${toolResult}\n\nNow respond to the player with a short message about what you did or what happened. Keep it under 100 chars. Just the message, no tool calls.`;
+        }
         try {
           const followUp = await callLLM(followUpPrompt);
           const followUpParsed = parseLLMResponse(followUp);
-          const reply = followUpParsed.text || followUp || 'Done!';
-          bot.chat(reply.substring(0, 200));
-          logBehavior(`said: ${reply}`);
+          
+          // If follow-up returned a tool call (e.g. after add_task), execute it
+          if (followUpParsed.tool) {
+            console.log(`[LLM] Follow-up tool: ${followUpParsed.tool.name}(${JSON.stringify(followUpParsed.tool.args)})`);
+            try {
+              const result = await executeTool(followUpParsed.tool.name, followUpParsed.tool.args, username);
+              logBehavior(`follow-up tool: ${followUpParsed.tool.name} → ${result.substring(0, 100)}`);
+            } catch (toolErr) {
+              console.error(`[LLM] Follow-up tool error:`, toolErr.message);
+            }
+          } else {
+            // Just a chat message
+            const reply = followUpParsed.text || followUp || 'Done!';
+            bot.chat(reply.substring(0, 200));
+            logBehavior(`said: ${reply}`);
+          }
         } catch (e) {
           console.error('[LLM] Follow-up error:', e.message);
           // Fallback: send a generic response based on the tool
@@ -1341,19 +1698,15 @@ async function handleGoalSet(goalText) {
 // ══════════════════════════════════════════════════════════════════════════════
 
 async function callLLM(userMessage) {
-  const url = `${LLM_BASE_URL}/v1/chat/completions`;
+  const url = `${LLM_BASE_URL}${LLM_API_ENDPOINT}`;
   console.log(`[LLM] Calling: ${url}`);
 
   const body = {
-    model: 'local-model',
-    messages: [
-      { role: 'system', content: 'You are a Minecraft bot. Call exactly one tool per response. No explanations.' },
-      { role: 'user', content: userMessage },
-    ],
-    temperature: 0.7,
-    max_tokens: 512,
+    model: LLM_MODEL,
+    input: userMessage,
+    context_length: LLM_CONTEXT_LENGTH,
+    temperature: LLM_TEMPERATURE,
   };
-  // model: "local-model" tells LM Studio to use whatever model is currently loaded
 
   return new Promise((resolve, reject) => {
     const req = http.request(url, {
@@ -1367,13 +1720,20 @@ async function callLLM(userMessage) {
       res.on('end', () => {
         try {
           const json = JSON.parse(data);
-          if (json.choices && json.choices[0]) {
-            const content = json.choices[0].message?.content || '';
+          // Native endpoint returns output array
+          if (json.output && json.output.length > 0) {
+            // Find the last message in the output
+            const lastMsg = json.output.filter(o => o.type === 'message').pop();
+            const content = lastMsg?.content || '';
+            // Log stats
+            if (json.stats) {
+              console.log(`[LLM] Stats: ${json.stats.tokens_per_second?.toFixed(1)} t/s, TTFT: ${json.stats.time_to_first_token_seconds?.toFixed(2)}s, tokens: ${json.stats.input_tokens}in/${json.stats.total_output_tokens}out`);
+            }
             console.log(`[LLM] Got response (${content.length} chars): ${content.substring(0, 100)}...`);
             resolve(content);
           } else {
-            console.error('[LLM] Response has no choices:', data.substring(0, 200));
-            reject(new Error('No choices in LLM response'));
+            console.error('[LLM] Response has no output:', data.substring(0, 200));
+            reject(new Error('No output in LLM response'));
           }
         } catch (e) {
           console.error('[LLM] Failed to parse response:', data.substring(0, 200));
@@ -1454,7 +1814,7 @@ async function executeTool(name, args, sender) {
       }
 
       case 'mine': {
-        const blockName = args.block;
+        const blockName = resolveItemName(args.block, bot);
         const count = parseInt(args.count) || 1;
         if (!blockName) break;
 
@@ -1462,6 +1822,23 @@ async function executeTool(name, args, sender) {
         const blockInfo = getMcData(bot).blocksByName[blockName];
         const pickaxe = bot.inventory.items().find(i => i.name.includes('pickaxe'));
         const pickMining = pickaxe ? (RECIPES[pickaxe.name]?.mining || 0) : 0;
+
+        // Blocks that require a pickaxe (miningLevel > 0 or known pickaxe blocks)
+        const PICKAXE_BLOCKS = new Set([
+          'stone', 'cobblestone', 'deepslate', 'cobbled_deepslate',
+          'iron_ore', 'gold_ore', 'copper_ore', 'lapis_ore', 'redstone_ore', 'diamond_ore', 'emerald_ore', 'nether_gold_ore', 'nether_quartz_ore',
+          'ancient_debris', 'blackstone', 'polished_blackstone',
+          'stone_bricks', 'mossy_stone_bricks', 'cracked_stone_bricks',
+          'andesite', 'diorite', 'granite', 'tuff', 'infested_stone',
+          'iron_block', 'gold_block', 'copper_block', 'diamond_block', 'emerald_block', 'lapis_block', 'redstone_block',
+          'quartz_block', 'nether_brack', 'netherite_block',
+        ]);
+        const needsPickaxe = (blockInfo && blockInfo.requiredTool === 'pickaxe') || PICKAXE_BLOCKS.has(blockName);
+
+        if (needsPickaxe && !pickaxe) {
+          result = `No pickaxe! Can't mine ${blockName}. Craft a wooden_pickaxe first.`;
+          break;
+        }
 
         if (blockInfo && blockInfo.requiredTool === 'pickaxe' && blockInfo.miningLevel > pickMining) {
           const neededTier = blockInfo.miningLevel <= 1 ? 'stone' : blockInfo.miningLevel <= 2 ? 'iron' : 'diamond';
@@ -1471,13 +1848,21 @@ async function executeTool(name, args, sender) {
 
         await executeWithTimeout(async () => {
           for (let i = 0; i < count; i++) {
+            // Check if inventory is full
+            if (isInventoryFull(bot)) {
+              result = `Inventory full! Mined ${i}/${count} blocks. Go home to deposit.`;
+              break;
+            }
+
+            // Use larger search radius for deep blocks (stone, ores, etc.)
+            const searchRadius = needsPickaxe ? 64 : 32;
             const block = bot.findBlock({
               matching: (b) => b.name === blockName,
-              maxDistance: 32,
+              maxDistance: searchRadius,
               count: 1,
             });
             if (!block) {
-              result = `No ${blockName} found nearby`;
+              result = `No ${blockName} found within ${searchRadius} blocks`;
               break;
             }
             try {
@@ -1500,6 +1885,12 @@ async function executeTool(name, args, sender) {
         const count = parseInt(args.count) || 3;
         await executeWithTimeout(async () => {
           for (let i = 0; i < count; i++) {
+            // Check if inventory is full
+            if (isInventoryFull(bot)) {
+              result = `Inventory full! Chopped ${i}/${count} logs. Go home to deposit.`;
+              break;
+            }
+
             const log = bot.findBlock({
               matching: (b) => b.name.includes('_log'),
               maxDistance: 32,
@@ -1528,30 +1919,164 @@ async function executeTool(name, args, sender) {
       case 'dig': {
         const dir = args.direction || 'down';
         const count = parseInt(args.count) || 1;
-        const offsets = {
-          down: new Vec3(0, -1, 0),
-          up: new Vec3(0, 1, 0),
-          forward: bot.entity.position.offset(0, 0, 0).minus(bot.entity.position).add(bot.lookAt ? new Vec3(0, 0, -1) : new Vec3(0, 0, -1)),
-        };
-        // Simplified: dig the block in the specified direction
-        const targetPos = bot.entity.position.offset(
-          dir === 'forward' ? -Math.round(Math.sin(bot.entity.yaw)) : 0,
-          dir === 'up' ? 1 : dir === 'down' ? -1 : 0,
-          dir === 'forward' ? -Math.round(Math.cos(bot.entity.yaw)) : 0,
-        );
-        const block = bot.blockAt(targetPos);
-        if (block && block.name !== 'air') {
-          await bot.dig(block);
-          logBehavior(`dug ${dir}`);
-          result = `Dug ${dir}`;
-        } else {
-          result = `Nothing to dig ${dir}`;
+        const targetY = args.y !== undefined ? parseFloat(args.y) : null;
+        let dug = 0;
+
+        // ── STAIRCASE MODE ──────────────────────────────────────────────────
+        // Digs a 2-wide, 2-tall staircase downward with safety checks
+        if (dir === 'staircase') {
+          await executeWithTimeout(async () => {
+            const steps = count || 64;
+            const yaw = bot.entity.yaw;
+            const fwdX = -Math.round(Math.sin(yaw));
+            const fwdZ = -Math.round(Math.cos(yaw));
+
+            for (let s = 0; s < steps; s++) {
+              // Stop if inventory is full
+              if (isInventoryFull(bot)) {
+                result = `Inventory full! Dug ${s}/${steps} steps. Go home to deposit.`;
+                break;
+              }
+
+              // Stop if we reached target Y
+              if (targetY !== null && bot.entity.position.y <= targetY + 1) break;
+
+              // SAFETY CHECK: Look ahead for danger
+              const lookAheadPos = bot.entity.position.offset(fwdX * 3, -3, fwdZ * 3);
+              const lookAheadBlock = bot.blockAt(lookAheadPos);
+              if (lookAheadBlock) {
+                // Stop if we see lava, void, or a long drop
+                if (lookAheadBlock.name === 'lava' || lookAheadBlock.name === 'void_air') {
+                  result = `Stopped — detected ${lookAheadBlock.name} ahead!`;
+                  break;
+                }
+              }
+
+              // SAFETY CHECK: Make sure there's ground below the next position
+              const nextFloorPos = bot.entity.position.offset(fwdX, -2, fwdZ);
+              const nextFloorBlock = bot.blockAt(nextFloorPos);
+              if (!nextFloorBlock || nextFloorBlock.name === 'air' || nextFloorBlock.name === 'void_air') {
+                // No ground below — place a block to bridge the gap
+                const bridgingBlock = bot.inventory.items().find(i =>
+                  i.name.includes('cobblestone') || i.name.includes('stone') ||
+                  i.name.includes('dirt') || i.name.includes('planks')
+                );
+                if (bridgingBlock) {
+                  await bot.equip(bridgingBlock, 'hand');
+                  await bot.placeBlock(nextFloorBlock || bot.blockAt(nextFloorPos), new Vec3(0, 1, 0));
+                  logBehavior(`placed bridge block at y=${Math.round(nextFloorPos.y)}`);
+                } else {
+                  result = `Stopped — no ground ahead and no blocks to bridge!`;
+                  break;
+                }
+              }
+
+              // Dig 2 blocks forward (2 wide) at head height and foot height
+              for (let w = 0; w < 2; w++) {
+                const sideX = w === 0 ? 0 : (fwdZ !== 0 ? 1 : 0);
+                const sideZ = w === 0 ? 0 : (fwdX !== 0 ? 1 : 0);
+
+                for (let h = 0; h < 2; h++) {
+                  const digPos = bot.entity.position.offset(
+                    fwdX + sideX,
+                    h,
+                    fwdZ + sideZ
+                  );
+                  const block = bot.blockAt(digPos);
+                  if (block && block.name !== 'air') {
+                    // Don't dig lava!
+                    if (block.name === 'lava' || block.name === 'water') {
+                      result = `Stopped — hit ${block.name}!`;
+                      return;
+                    }
+                    try {
+                      await bot.dig(block);
+                      dug++;
+                      await new Promise(r => setTimeout(r, 200));
+                    } catch (e) { break; }
+                  }
+                }
+              }
+
+              // Dig the block below us (the step down)
+              const belowPos = bot.entity.position.offset(0, -1, 0);
+              const belowBlock = bot.blockAt(belowPos);
+              if (belowBlock && belowBlock.name !== 'air') {
+                if (belowBlock.name === 'lava' || belowBlock.name === 'water') {
+                  result = `Stopped — hit ${belowBlock.name} below!`;
+                  return;
+                }
+                try {
+                  await bot.dig(belowBlock);
+                  dug++;
+                  await new Promise(r => setTimeout(r, 200));
+                } catch (e) { break; }
+              }
+
+              // Dig second block below (2 tall headroom)
+              const below2Pos = bot.entity.position.offset(0, -2, 0);
+              const below2Block = bot.blockAt(below2Pos);
+              if (below2Block && below2Block.name !== 'air') {
+                if (below2Block.name === 'lava' || below2Block.name === 'water') {
+                  result = `Stopped — hit ${below2Block.name} below!`;
+                  return;
+                }
+                try {
+                  await bot.dig(below2Block);
+                  dug++;
+                  await new Promise(r => setTimeout(r, 200));
+                } catch (e) { break; }
+              }
+
+              // Actually move the bot using controls (not fake position)
+              // Walk forward and drop down
+              bot.setControlState('forward', true);
+              await new Promise(r => setTimeout(r, 500));
+              bot.setControlState('forward', false);
+              await new Promise(r => setTimeout(r, 200));
+
+              logBehavior(`staircase step ${s + 1}: y=${Math.round(bot.entity.position.y)}`);
+            }
+          });
+          result = dug > 0 ? `Dug staircase ${dug} blocks (now at y=${Math.round(bot.entity.position.y)})` : 'Could not dig staircase';
+          break;
         }
+
+        // ── NORMAL DIG MODE (forward/up only — never straight down!) ───────
+        if (dir === 'down') {
+          result = 'NEVER dig straight down! Use direction:"staircase" instead.';
+          break;
+        }
+
+        await executeWithTimeout(async () => {
+          for (let i = 0; i < count; i++) {
+            if (targetY !== null && dir === 'down' && bot.entity.position.y <= targetY + 1) break;
+
+            const targetPos = bot.entity.position.offset(
+              dir === 'forward' ? -Math.round(Math.sin(bot.entity.yaw)) : 0,
+              dir === 'down' ? -1 : dir === 'up' ? 1 : 0,
+              dir === 'forward' ? -Math.round(Math.cos(bot.entity.yaw)) : 0,
+            );
+            const block = bot.blockAt(targetPos);
+            if (!block || block.name === 'air') break;
+
+            try {
+              await bot.dig(block);
+              dug++;
+              logBehavior(`dug ${dir} (${dug}/${count}) y=${Math.round(bot.entity.position.y)}`);
+              await new Promise(r => setTimeout(r, 300));
+            } catch (e) {
+              break;
+            }
+          }
+        });
+
+        result = dug > 0 ? `Dug ${dug} blocks ${dir} (now at y=${Math.round(bot.entity.position.y)})` : `Nothing to dig ${dir}`;
         break;
       }
 
       case 'place': {
-        const blockName = args.block;
+        const blockName = resolveItemName(args.block, bot);
         const x = parseFloat(args.x);
         const y = parseFloat(args.y);
         const z = parseFloat(args.z);
@@ -1575,7 +2100,7 @@ async function executeTool(name, args, sender) {
       }
 
       case 'equip': {
-        const itemName = args.item || args.name;
+        const itemName = resolveItemName(args.item || args.name, bot);
         if (!itemName) { result = 'No item specified'; break; }
         const item = bot.inventory.items().find(i => i.name.includes(itemName));
         if (item) {
@@ -1612,7 +2137,7 @@ async function executeTool(name, args, sender) {
       }
 
       case 'craft': {
-        const itemName = args.item || args.name;
+        const itemName = resolveItemName(args.item || args.name, bot);
         const count = parseInt(args.count) || 1;
         if (!itemName) { result = 'No item specified'; break; }
 
@@ -1789,7 +2314,7 @@ async function executeTool(name, args, sender) {
       }
 
       case 'drop': {
-        const itemName = args.item || args.name;
+        const itemName = resolveItemName(args.item || args.name, bot);
         const count = parseInt(args.count) || 1;
         if (!itemName) { result = 'No item specified'; break; }
         const item = bot.inventory.items().find(i => i.name.includes(itemName));
@@ -1926,6 +2451,75 @@ async function executeTool(name, args, sender) {
       case 'idle': {
         logBehavior('idling');
         result = 'Idling';
+        break;
+      }
+
+      case 'set_home': {
+        setHome(bot.entity.position);
+        result = `Home set to (${Math.round(bot.entity.position.x)}, ${Math.round(bot.entity.position.y)}, ${Math.round(bot.entity.position.z)})`;
+        break;
+      }
+
+      case 'go_home': {
+        const home = getHome();
+        if (!home) { result = 'No home set! Use set_home first.'; break; }
+        await executeWithTimeout(async () => {
+          bot.pathfinder.setGoal(new pf.goals.GoalBlock(home.x, home.y, home.z));
+          await new Promise((resolve) => {
+            const check = setInterval(() => {
+              const dist = bot.entity.position.distanceTo(new Vec3(home.x, home.y, home.z));
+              if (dist < 3 || !bot.pathfinder.goal) {
+                clearInterval(check);
+                resolve();
+              }
+            }, 500);
+            setTimeout(() => { clearInterval(check); resolve(); }, 30000);
+          });
+        });
+        result = `Went home (${home.x}, ${home.y}, ${home.z})`;
+        break;
+      }
+
+      case 'deposit': {
+        try {
+          result = await depositItems(bot);
+        } catch (e) {
+          result = `Deposit failed: ${e.message}`;
+        }
+        break;
+      }
+
+      case 'check_inventory': {
+        const empty = emptySlotCount(bot);
+        const total = bot.inventory.items().reduce((sum, i) => sum + i.count, 0);
+        result = `Inventory: ${36 - empty}/36 slots used, ${empty} empty, ${total} total items`;
+        break;
+      }
+
+      case 'add_task': {
+        const text = args.text || args.description || args.task;
+        if (!text) { result = 'No task description'; break; }
+        const task = addTask(text);
+        logBehavior(`added task: ${text}`);
+        result = `Task added: "${text}" (${taskList.length}/${MAX_TASKS} tasks)`;
+        break;
+      }
+
+      case 'complete_task': {
+        const idOrText = args.id || args.text || args.task;
+        if (!idOrText) { result = 'No task ID or text'; break; }
+        const completed = completeTask(idOrText);
+        if (completed) {
+          logBehavior(`completed task: ${completed.text}`);
+          result = `Task done: "${completed.text}" (${taskList.filter(t => t.status === 'pending').length} remaining)`;
+        } else {
+          result = `Task not found: "${idOrText}"`;
+        }
+        break;
+      }
+
+      case 'get_tasks': {
+        result = getTaskSummary();
         break;
       }
 
