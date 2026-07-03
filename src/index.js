@@ -2987,7 +2987,7 @@ setInterval(() => {
   });
 
   broadcast('goal', { tree: goalTree, summary: getGoalSummary() });
-  broadcast('logs', { behavior: behaviorLog.slice(-20), monologue: lastMonologue });
+  broadcast('logs', { behavior: behaviorLog.slice(-20), monologue: lastMonologueText });
   broadcast('chat', chatHistory.slice(-20));
   broadcast('inventory', {
     items: bot.inventory.items().map(i => ({ name: i.name, count: i.count })),
